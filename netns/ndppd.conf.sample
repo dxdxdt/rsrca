@@ -1,0 +1,10 @@
+route-ttl 30000
+
+proxy eth0 {
+   router yes
+   timeout 500
+   ttl 30000
+   rule fd12:34::/64 {
+      static
+   }
+}
