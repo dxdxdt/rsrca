@@ -5,8 +5,8 @@
             "includePath": [
                 "${workspaceFolder}/**"
             ],
-            "defines": [],
-            "cStandard": "c23",
+            "defines": [ "_GNU_SOURCE" ],
+            "cStandard": "c17",
             "intelliSenseMode": "linux-gcc-x64",
             "compilerPath": "/usr/bin/gcc"
         }

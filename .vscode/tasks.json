@@ -1,0 +1,25 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"type": "cmake",
+			"label": "CMake: configure debug",
+			"command": "configure",
+			"options": {
+				"environment": {
+					"CMAKE_BUILD_TYPE": "Debug"
+				}
+			}
+		},
+		{
+			"type": "cmake",
+			"label": "CMake: build",
+			"command": "build",
+			"targets": [ "all" ],
+			"group": "build",
+			"problemMatcher": [],
+			"detail": "CMake template build task",
+			"dependsOn": [ "CMake: configure debug" ]
+		}
+	]
+}

