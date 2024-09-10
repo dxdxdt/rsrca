@@ -1,5 +1,6 @@
 [Unit]
-Description=MTU1280 network namespace set up
+Description=ASYMMETRIC MTU1280 netns
+Documentation=https://github.com/si-magic/mtu1280d/tree/master/netns
 Requires=network.target
 After=network.target
 

@@ -106,9 +106,10 @@ mkns () {
 	# default route from mtu1280-a to system
 	safe_run "$MTU1280NS_ADDR4_A0" ip -n mtu1280-a -4 route add default dev veth-mtu1280-gw via $(filter_cidr "$MTU1280NS_ADDR4_A0")
 	ip -n mtu1280-a -6 route add default dev veth-mtu1280-gw via $(get_ll_addr veth-mtu1280-a)
-	# default route from mtu1280-b to mtu1280-a (mtu 1280 segment)
-	safe_run "$MTU1280NS_ADDR4_B0" ip -n mtu1280-b -4 route add default dev veth-mtu1280-a via $(filter_cidr "$MTU1280NS_ADDR4_B0") mtu 1280
-	ip -n mtu1280-b -6 route add default dev veth-mtu1280-a via $(get_ll_addr veth-mtu1280-b mtu1280-a) mtu 1280
+	# default route from mtu1280-b to mtu1280-a
+	# originally a mtu 1280 link to the upstream. Here, patched for POC env
+	safe_run "$MTU1280NS_ADDR4_B0" ip -n mtu1280-b -4 route add default dev veth-mtu1280-a via $(filter_cidr "$MTU1280NS_ADDR4_B0") #mtu 1280
+	ip -n mtu1280-b -6 route add default dev veth-mtu1280-a via $(get_ll_addr veth-mtu1280-b mtu1280-a) #mtu 1280
 	# default route from mtu1280-c to mtu1280-b
 	safe_run "$MTU1280NS_ADDR4_C0" ip -n mtu1280-c -4 route add default dev veth-mtu1280-b via $(filter_cidr "$MTU1280NS_ADDR4_C0")
 	ip -n mtu1280-c -6 route add default dev veth-mtu1280-b via $(get_ll_addr veth-mtu1280-c mtu1280-b)
