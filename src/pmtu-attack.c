@@ -17,12 +17,14 @@
 #include <netdb.h>
 #include <time.h>
 
+#include "rnd_well512.h"
+
 #define ARGV0 "pmtu-attack"
 
 
 struct {
 	struct {
-		int urnd;
+		int urnd; // kept open to seed the prng when required.
 		int sck;
 	} fd;
 	struct {
@@ -32,6 +34,9 @@ struct {
 		struct timespec ts_last_report;
 		size_t last_it_cnt;
 	} bm;
+	struct {
+		rnd_well512_t well512;
+	} rnd;
 } gctx;
 
 struct {
@@ -63,12 +68,12 @@ static void init_global (void) {
 static void free_global (void) {
 	close(gctx.fd.urnd);
 	close(gctx.fd.sck);
-
 }
 
 static bool alloc_globals (void) {
 	gctx.fd.urnd = open("/dev/urandom", O_RDONLY);
 	if (gctx.fd.urnd < 0) {
+		fprintf(stderr, ARGV0": ");
 		perror("/dev/urandom");
 		return false;
 	}
@@ -76,7 +81,8 @@ static bool alloc_globals (void) {
 	if (!param.flags.dryrun) {
 		gctx.fd.sck = socket(AF_INET6, SOCK_RAW, IPPROTO_RAW);
 		if (gctx.fd.sck < 0) {
-			perror("socket(AF_INET6, SOCK_RAW, IPPROTO_RAW)");
+			fprintf(stderr, ARGV0": ");
+			perror("socket()");
 			return false;
 		}
 	}
@@ -86,11 +92,12 @@ static bool alloc_globals (void) {
 	return true;
 }
 
+static void seedrnd (void) {
+	read(gctx.fd.urnd, gctx.rnd.well512.state, sizeof(gctx.rnd.well512.state));
+}
+
 static void genrnd (const size_t len, void *out) {
-	// the function will be called many times and read() takes a trip outside of
-	// userland. Needs some improvements.
-	read(gctx.fd.urnd, out, len);
-	// TODO: use ctrdrbg or mt
+	rnd_well512(&gctx.rnd.well512, out, len);
 }
 
 static void print_help (FILE *f) {
@@ -325,12 +332,15 @@ static void mount_attack_icmp6_ptb(void) {
 
 static int main_ptb_flood_icmp6_echo (void) {
 	// TODO: parallelise?
+	seedrnd();
 	mount_attack_icmp6_ptb();
 	return 0;
 }
 
 static int main_txt_dns_flood (void) {
 	// TODO: parallelise?
+	seedrnd();
+	// TODO
 	return 0;
 }
 
