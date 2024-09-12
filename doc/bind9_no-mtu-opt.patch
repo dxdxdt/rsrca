@@ -1,0 +1,48 @@
+diff --git a/lib/isc/netmgr/tcp.c b/lib/isc/netmgr/tcp.c
+index c106968c26..082f6446f0 100644
+--- a/lib/isc/netmgr/tcp.c
++++ b/lib/isc/netmgr/tcp.c
+@@ -259,8 +259,8 @@ isc_nm_tcpconnect(isc_nm_t *mgr, isc_sockaddr_t *local, isc_sockaddr_t *peer,
+        req->local = *local;
+        req->handle = isc__nmhandle_get(sock, &req->peer, &sock->iface);
+ 
+-       (void)isc__nm_socket_min_mtu(sock->fd, sa_family);
+-       (void)isc__nm_socket_tcp_maxseg(sock->fd, NM_MAXSEG);
++       // (void)isc__nm_socket_min_mtu(sock->fd, sa_family);
++       // (void)isc__nm_socket_tcp_maxseg(sock->fd, NM_MAXSEG);
+ 
+        sock->active = true;
+ 
+@@ -316,8 +316,8 @@ start_tcp_child_job(void *arg) {
+        isc_loop_t *loop = sock->worker->loop;
+        struct sockaddr_storage ss;
+ 
+-       (void)isc__nm_socket_min_mtu(sock->fd, sa_family);
+-       (void)isc__nm_socket_tcp_maxseg(sock->fd, NM_MAXSEG);
++       // (void)isc__nm_socket_min_mtu(sock->fd, sa_family);
++       // (void)isc__nm_socket_tcp_maxseg(sock->fd, NM_MAXSEG);
+ 
+        r = uv_tcp_init(&loop->loop, &sock->uv_handle.tcp);
+        UV_RUNTIME_CHECK(uv_tcp_init, r);
+diff --git a/lib/isc/netmgr/udp.c b/lib/isc/netmgr/udp.c
+index 1bcff168b2..8ec6ccb07b 100644
+--- a/lib/isc/netmgr/udp.c
++++ b/lib/isc/netmgr/udp.c
+@@ -108,7 +108,7 @@ start_udp_child_job(void *arg) {
+        isc_nm_t *mgr = sock->worker->netmgr;
+        isc_loop_t *loop = sock->worker->loop;
+ 
+-       (void)isc__nm_socket_min_mtu(sock->fd, sa_family);
++       // (void)isc__nm_socket_min_mtu(sock->fd, sa_family);
+ 
+ #if HAVE_DECL_UV_UDP_RECVMMSG
+        uv_init_flags |= UV_UDP_RECVMMSG;
+@@ -814,7 +814,7 @@ isc_nm_udpconnect(isc_nm_t *mgr, isc_sockaddr_t *local, isc_sockaddr_t *peer,
+ 
+        (void)isc__nm_socket_disable_pmtud(sock->fd, sa_family);
+ 
+-       (void)isc__nm_socket_min_mtu(sock->fd, sa_family);
++       // (void)isc__nm_socket_min_mtu(sock->fd, sa_family);
+ 
+        /* Initialize the request */
+        req = isc__nm_uvreq_get(sock);
