@@ -332,9 +332,9 @@ performance issue in the kernel. Random source address attack had no effect when
 the DNS server was off.
 
 Saw a ratio of 1:10 in traffic amplification(Rx: ~150Mbpx, Tx: 1.2Gbps). Note
-that it's only about 20% of the bandwidth available. Took 3 processes of
-`pmtu-attack` across 2 Hetzner instances to hog all the processors on the victim
-Windows machine, 4 to make it unstable and unresponsive. The RDP connection
+that it's only about 20% of the bandwidth available. Took 3 processes of `rsrca`
+across 2 Hetzner instances to hog all the processors on the victim Windows
+machine, 4 to make it unstable and unresponsive. The RDP connection
 dropping/stuttering, the IIS missing some HTTP requests, GUI becoming
 sluggish/unresponsive/frozen.
 
@@ -344,8 +344,8 @@ The CPU usage in the image shows an oscillating pattern. My guess is: when the
 context locks up in the cache update, the amount of traffic getting processed
 drops and shoots back up again when cache gc takes less time to finish.
 
-I'm sure `pmtu-attack` can be implemented in the kernel space for efficiency to
-reduce the resource ratio, but I think the POC is feasible enough.
+I'm sure `rsrca` can be implemented in the kernel space for efficiency to reduce
+the resource ratio, but I think the POC is feasible enough.
 
 ## TODO
 - Be sure to block incoming DNS so that the attacker host won't send back ICMP

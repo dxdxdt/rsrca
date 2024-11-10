@@ -21,7 +21,7 @@
 
 #include "rnd_well512.h"
 
-#define ARGV0 "pmtu-attack"
+#define ARGV0 "rsrca"
 
 
 struct {
