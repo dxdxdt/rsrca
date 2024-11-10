@@ -5,14 +5,15 @@
 	"version": "0.2.0",
 	"configurations": [
 		{
-			"name": "Launch pmtu-attack",
+			"name": "Launch rsrca",
 			"type": "cppdbg",
 			"request": "launch",
-			"program": "${workspaceFolder}/build/pmtu-attack",
+			"program": "${workspaceFolder}/build/rsrca",
 			"args": [
 				// "-v",
 				"-d",
-				"-m", "ptb_flood_icmp6_echo",
+				"-m", "syn_flood",
+				"-p", "53",
 				"fd12:34::/64",
 				"fd12:35::3f05:2108:5d2b:570"
 			],
@@ -33,10 +34,9 @@
 					"ignoreFailures": true
 				},
 				{
-					"description": "Follow child",
-					// "text": "-gdb-set follow-fork-mode parent",
-					"text": "-gdb-set follow-fork-mode child",
-					"ignoreFailures": false
+					"description": "Follow-fork-mode",
+					"text": "-gdb-set follow-fork-mode parent",
+					"ignoreFailures": true
 				}
 			],
 			"preLaunchTask": "CMake: build"

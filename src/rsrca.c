@@ -11,6 +11,7 @@
 #include <sys/wait.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/prctl.h>
 #include <netinet/ip6.h>
 #include <netinet/icmp6.h>
 #include <netinet/udp.h>
@@ -19,14 +20,13 @@
 #include <netdb.h>
 #include <time.h>
 
-#include "rnd_well512.h"
+#include "rnd_cpp.h"
 
 #define ARGV0 "rsrca"
+#define CACHE_SIZE 8192
 
-
-struct {
+static struct {
 	struct {
-		int urnd; // kept open to seed the prng when required.
 		int sck;
 	} fd;
 	struct {
@@ -37,7 +37,10 @@ struct {
 		uint64_t last_it_cnt;
 	} bm;
 	struct {
-		rnd_well512_t well512;
+		uint64_t cache[CACHE_SIZE];
+		size_t cur_c;
+		int pipe[2];
+		pid_t pid;
 	} rnd;
 	struct {
 		struct {
@@ -47,7 +50,7 @@ struct {
 	} dns;
 } gctx;
 
-struct {
+static struct {
 	struct {
 		uint8_t addr[16];
 		uint8_t mask[16];
@@ -74,27 +77,112 @@ struct {
 	uint64_t count;
 } param;
 
+static bool rnd_do_seed (void *ctx, const int fd) {
+	const size_t seed_size = rnd_cpp_seed_size(ctx);
+	uint8_t seed[seed_size];
+	ssize_t iofr;
+
+	iofr = read(fd, seed, seed_size);
+	if (iofr < 0) {
+		perror(ARGV0": seedrnd()");
+		return false;
+	}
+	assert(iofr == (ssize_t)seed_size);
+
+	rnd_cpp_seed(ctx, seed);
+
+	return true;
+}
+
+static bool rnd_init (void *ctx) {
+	static const rnd_cpp_t rct = RNDCPPTYPE_MT19937;
+	int fd = -1;
+	bool ret;
+
+	if (!rnd_cpp_setopt(ctx, &rct)) {
+		perror(ARGV0": rnd_cpp_setopt()");
+		return false;
+	}
+
+	fd = open("/dev/urandom", O_RDONLY);
+	if (fd < 0) {
+		perror(ARGV0": /dev/urandom");
+		return false;
+	}
+
+	ret = rnd_do_seed(ctx, fd);
+	close(fd);
+
+	return ret;
+}
+
+static void rnd_main (void) {
+	const size_t ctx_size = rnd_cpp_ctx_size();
+	uint8_t ctx[ctx_size];
+
+	prctl(PR_SET_NAME, ARGV0"_c-rnd");
+
+	memset(ctx, 0, ctx_size);
+	if (!rnd_init(ctx)) {
+		return;
+	}
+
+	while (true) {
+		rnd_cpp(ctx, (uint8_t*)gctx.rnd.cache, sizeof(gctx.rnd.cache));
+		write(gctx.rnd.pipe[1], gctx.rnd.cache, sizeof(gctx.rnd.cache));
+	}
+}
+
 static void init_params (void) {
 	param.dns.rtype = 16; // TXT
 	param.count = UINT64_MAX;
 }
 
 static void init_global (void) {
-	gctx.fd.urnd = -1;
 	gctx.fd.sck = -1;
+	gctx.rnd.cur_c = SIZE_MAX;
+
+	gctx.rnd.pid = -1;
+	gctx.rnd.pipe[0] = -1;
+	gctx.rnd.pipe[1] = -1;
 }
 
 static void free_global (void) {
-	close(gctx.fd.urnd);
 	close(gctx.fd.sck);
+	close(gctx.rnd.pipe[0]);
+	close(gctx.rnd.pipe[1]);
 }
 
 static bool alloc_globals (void) {
-	gctx.fd.urnd = open("/dev/urandom", O_RDONLY);
-	if (gctx.fd.urnd < 0) {
-		fprintf(stderr, ARGV0": ");
-		perror("/dev/urandom");
+	int fr;
+
+	fr = pipe(gctx.rnd.pipe);
+	if (fr == 0) {
+		int pipe_size = sizeof(gctx.rnd.cache);
+
+		fcntl(gctx.rnd.pipe[0], F_SETPIPE_SZ, pipe_size);
+		fcntl(gctx.rnd.pipe[1], F_SETPIPE_SZ, pipe_size);
+	}
+	else {
+		perror(ARGV0": pipe()");
 		return false;
+	}
+
+	gctx.rnd.pid = fork();
+	if (gctx.rnd.pid < 0) {
+		perror(ARGV0": fork()");
+		return false;
+	}
+	else if (gctx.rnd.pid == 0) {
+		close(gctx.rnd.pipe[0]);
+		gctx.rnd.pipe[0] = -1;
+
+		rnd_main();
+		abort();
+	}
+	else {
+		close(gctx.rnd.pipe[1]);
+		gctx.rnd.pipe[1] = -1;
 	}
 
 	if (!param.flags.dryrun) {
@@ -111,12 +199,52 @@ static bool alloc_globals (void) {
 	return true;
 }
 
-static void seedrnd (void) {
-	read(gctx.fd.urnd, gctx.rnd.well512.state, sizeof(gctx.rnd.well512.state));
+static void flush_rnd (void) {
+	ssize_t iofr;
+
+	iofr = read(gctx.rnd.pipe[0], gctx.rnd.cache, sizeof(gctx.rnd.cache));
+	if (iofr != sizeof(gctx.rnd.cache)) {
+		fprintf(stderr, ARGV0": rnd child died\n");
+		abort();
+	}
+
+	gctx.rnd.cur_c = 0;
 }
 
-static void genrnd (const size_t len, void *out) {
-	rnd_well512(&gctx.rnd.well512, out, len);
+static uint64_t pull_rnd (void) {
+	if (gctx.rnd.cur_c >= CACHE_SIZE) {
+		flush_rnd();
+	}
+
+	return gctx.rnd.cache[gctx.rnd.cur_c++];
+}
+
+static void genrnd (size_t len, void *out) {
+	uint8_t *buf = (uint8_t*)out;
+	uint64_t n;
+	size_t consume;
+
+	if ((uintptr_t)out % sizeof(uint64_t) == 0) { // aligned
+		while (len >= sizeof(uint64_t) * 2) {
+			*((uint64_t*)buf) = pull_rnd();
+			*((uint64_t*)buf + 1) = pull_rnd();
+			len -= sizeof(uint64_t) * 2;
+			buf += sizeof(uint64_t) * 2;
+		}
+		while (len >= sizeof(uint64_t)) {
+			*((uint64_t*)buf) = pull_rnd();
+			len -= sizeof(uint64_t);
+			buf += sizeof(uint64_t);
+		}
+	}
+
+	while (len > 0) {
+		n = pull_rnd();
+		consume = len > sizeof(n) ? sizeof(n) : len;
+		memcpy(buf, &n, consume);
+		len -= consume;
+		buf += consume;
+	}
 }
 
 static void print_help (FILE *f) {
@@ -349,7 +477,6 @@ static void mount_attack_icmp6_ptb (void) {
 
 static int main_ptb_flood_icmp6_echo (void) {
 	// TODO: parallelise?
-	seedrnd();
 	mount_attack_icmp6_ptb();
 	return 0;
 }
@@ -498,8 +625,6 @@ static int main_dns_flood (void) {
 	// TODO: parallelise?
 	init_dns_txt_labels();
 
-	seedrnd();
-
 	mount_attack_dns_flood();
 
 	return 0;
@@ -558,8 +683,6 @@ static void mount_attack_syn_flood (void) {
 }
 
 static int main_syn_flood (void) {
-	seedrnd();
-
 	mount_attack_syn_flood();
 
 	return 0;
