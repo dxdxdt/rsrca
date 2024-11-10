@@ -281,7 +281,7 @@ static bool alloc_g (void) {
 }
 
 static void dealloc_g (void) {
-	if (opts.rnd.deseed != NULL) {
+	if (opts.rnd.deseed != NULL && g.ctx != NULL) {
 		opts.rnd.deseed(g.ctx);
 	}
 	free(g.ctx);
