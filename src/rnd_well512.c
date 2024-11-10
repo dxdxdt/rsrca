@@ -19,9 +19,31 @@ static uint32_t rnd_well512_pull (rnd_well512_t *ctx) {
 	return ctx->state[ctx->index];
 }
 
+size_t rnd_well512_ctx_size (void) {
+	return sizeof(uint32_t[16]);
+}
+
+size_t rnd_well512_seed_size (rnd_well512_t *ctx) {
+	return sizeof(ctx->state);
+}
+
 void rnd_well512 (rnd_well512_t *ctx, uint8_t *buf, size_t len) {
 	size_t consume;
 	uint32_t n;
+
+	if ((uintptr_t)buf % sizeof(uint32_t) == 0) { // if aligned
+		while (len >= sizeof(uint32_t) * 2) {
+			*((uint32_t*)buf) = rnd_well512_pull(ctx);
+			*((uint32_t*)buf + 1) = rnd_well512_pull(ctx);
+			buf += sizeof(uint32_t) * 2;
+			len -= sizeof(uint32_t) * 2;
+		}
+		if (len >= sizeof(uint32_t)) {
+			*((uint32_t*)buf) = rnd_well512_pull(ctx);
+			buf += sizeof(uint32_t);
+			len -= sizeof(uint32_t);
+		}
+	}
 
 	while (len > 0) {
 		n = rnd_well512_pull(ctx);

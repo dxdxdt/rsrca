@@ -3,7 +3,6 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
-#include <stdbool.h>
 
 
 typedef struct {
@@ -11,5 +10,7 @@ typedef struct {
 	size_t index;
 } rnd_well512_t;
 
+size_t rnd_well512_ctx_size (void);
+size_t rnd_well512_seed_size (rnd_well512_t *ctx);
 void rnd_well512 (rnd_well512_t *ctx, uint8_t *buf, size_t len);
 void rnd_well512_seed (rnd_well512_t *ctx, const uint8_t *seed);

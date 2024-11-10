@@ -1,0 +1,24 @@
+#!/bin/bash
+ARGV0="run_rngtest"
+TYPES="
+	well512
+	rdrnd
+	cpp
+	cpp_minstd
+	cpp_mt
+	cpp_ranlux
+	cpp_knuthb
+"
+
+if [ -z "$1" ]; then
+	n="10000000"
+else
+	n="$1"
+fi
+echo "$ARGV0: count = $n"
+
+for t in $TYPES
+do
+	printf -- "---------- type: %-10s ----------\n" "$t"
+	./rsrca-rnd -t "$t" -n "$n" -b | rngtest
+done

@@ -40,6 +40,31 @@
 				}
 			],
 			"preLaunchTask": "CMake: build"
+		},
+		{
+			"name": "Launch rsrca-rnd",
+			"type": "cppdbg",
+			"request": "launch",
+			"program": "${workspaceFolder}/build/rsrca-rnd",
+			"args": [ "-t", "cpp_mt", "-n", "1000000" ],
+			"stopAtEntry": false,
+			"cwd": "${workspaceFolder}/build",
+			"environment": [],
+			"externalConsole": false,
+			"MIMode": "gdb",
+			"setupCommands": [
+				{
+					"description": "Enable pretty-printing for gdb",
+					"text": "-enable-pretty-printing",
+					"ignoreFailures": true
+				},
+				{
+					"description": "Set Disassembly Flavor to Intel",
+					"text": "-gdb-set disassembly-flavor intel",
+					"ignoreFailures": true
+				}
+			],
+			"preLaunchTask": "CMake: build"
 		}
 	]
 }

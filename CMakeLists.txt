@@ -1,7 +1,8 @@
 cmake_minimum_required(VERSION 3.19)
 
-project(pmtu-attack VERSION 0.0.0 LANGUAGES C)
+project(pmtu-attack VERSION 0.0.0 LANGUAGES C CXX)
 
+include(CheckSymbolExists)
 include(GNUInstallDirs)
 
 add_compile_options(
@@ -14,9 +15,12 @@ add_compile_options(
 	-Wall
 	-Wextra
 	-Wno-unused-parameter
-	-Werror=implicit-function-declaration
+	$<$<COMPILE_LANGUAGE:C>:-Werror=implicit-function-declaration>
 	-D_GNU_SOURCE)
 
-add_executable(pmtu-attack src/pmtu-attack.c src/rnd_well512.c)
+check_symbol_exists(_rdrand64_step immintrin.h HAVE_RDRAND64_STEP)
 
-install(TARGETS pmtu-attack)
+add_executable(pmtu-attack src/pmtu-attack.c src/rnd_well512.c)
+add_executable(rsrca-rnd src/rsrca-rnd.c src/rnd_well512.c src/rnd_rdrnd.c src/rnd_cpp.cpp)
+
+install(TARGETS pmtu-attack rsrca-rnd)
