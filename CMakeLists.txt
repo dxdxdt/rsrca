@@ -20,7 +20,19 @@ add_compile_options(
 
 check_symbol_exists(_rdrand64_step immintrin.h HAVE_RDRAND64_STEP)
 
-add_executable(rsrca src/rsrca.c src/rnd_cpp.cpp)
-add_executable(rsrca-rnd src/rsrca-rnd.c src/rnd_well512.c src/rnd_rdrnd.c src/rnd_cpp.cpp)
+add_executable(rsrca
+	src/rsrca.c
+	src/dns-utils.c
+	src/rnd_cpp.cpp
+	src/inetchksm.c)
+add_executable(rsrca-rnd
+	src/rsrca-rnd.c
+	src/rnd_well512.c
+	# src/rnd_rdrnd.c
+	src/rnd_cpp.cpp)
+add_executable(rsrca-ns
+	src/rsrca-ns.c
+	src/dns-utils.c
+	src/rnd_cpp.cpp)
 
 install(TARGETS rsrca rsrca-rnd)

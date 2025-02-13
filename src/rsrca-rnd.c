@@ -71,7 +71,7 @@ static bool getrndbyname (const char *name, rnt_t *out) {
 
 		found = true;
 	}
-	else if (strcmp(name, "rdrnd") == 0) {
+	else if (false && strcmp(name, "rdrnd") == 0) {
 		ret.name = "rdrnd";
 		ret.c_size = rnd_rdrnd_ctx_size();
 		ret.gen = (void (*)(void *ctx, void *buf, size_t len))rnd_rdrnd;

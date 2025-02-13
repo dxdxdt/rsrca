@@ -65,6 +65,36 @@
 				}
 			],
 			"preLaunchTask": "CMake: build"
+		},
+		{
+			"name": "Launch rsrca-ns",
+			"type": "cppdbg",
+			"request": "launch",
+			"program": "${workspaceFolder}/build/rsrca-ns",
+			"args": [ "-vvvvv", "-p", "15353", "-T1" ],
+			"stopAtEntry": false,
+			"cwd": "${workspaceFolder}/build",
+			"environment": [],
+			"externalConsole": false,
+			"MIMode": "gdb",
+			"setupCommands": [
+				{
+					"description": "Enable pretty-printing for gdb",
+					"text": "-enable-pretty-printing",
+					"ignoreFailures": true
+				},
+				{
+					"description": "Set Disassembly Flavor to Intel",
+					"text": "-gdb-set disassembly-flavor intel",
+					"ignoreFailures": true
+				},
+				{
+					"description": "Follow-fork-mode",
+					"text": "-gdb-set follow-fork-mode child",
+					"ignoreFailures": true
+				}
+			],
+			"preLaunchTask": "CMake: build"
 		}
 	]
 }

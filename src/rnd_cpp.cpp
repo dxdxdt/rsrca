@@ -127,9 +127,9 @@ size_t rnd_cpp_seed_size (void *ctx_in) {
 	return ctx->engine->result_size();
 }
 
-void rnd_cpp (void *ctx_in, uint8_t *buf, size_t len) {
+void rnd_cpp (void *ctx_in, void *buf, size_t len) {
 	rnd_cpp_ctx_t *ctx = (rnd_cpp_ctx_t*)ctx_in;
-	return ctx->engine->gen(buf, len);
+	return ctx->engine->gen((uint8_t*)buf, len);
 }
 
 bool rnd_cpp_setopt (void *ctx_in, const void *opt) {
@@ -154,7 +154,7 @@ bool rnd_cpp_setopt (void *ctx_in, const void *opt) {
 	return true;
 }
 
-void rnd_cpp_seed (void *ctx_in, const uint8_t *seed) {
+void rnd_cpp_seed (void *ctx_in, const void *seed) {
 	rnd_cpp_ctx_t *ctx = (rnd_cpp_ctx_t*)ctx_in;
 	ctx->engine->seed(seed);
 }
