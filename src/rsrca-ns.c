@@ -429,7 +429,7 @@ static bool parse_dns_msg (
 
 	offset = 12;
 	for (i = 0; i < dh->q_count && i < q_size; i += 1) {
-		if (offset >= len) {
+		if (offset > len) {
 			errno = EBADMSG;
 			return false;
 		}
@@ -506,7 +506,7 @@ static bool parse_dns_msg (
 
 		// parse question
 
-		if (offset + 4 >= len) {
+		if (offset + 4 > len) {
 			errno = EBADMSG;
 			return false;
 		}
@@ -524,7 +524,8 @@ static bool parse_dns_msg (
 static void report_dns_msg (
 	FILE *f,
 	const struct dns_header *dh,
-	const struct dns_query *q)
+	const struct dns_query *q,
+	const size_t q_size)
 {
 	size_t i;
 
@@ -552,7 +553,7 @@ static void report_dns_msg (
 		dh->add_count);
 
 	fprintf(f, ";; QUESTION SECTION:\n");
-	for (i = 0; i < dh->q_count; i += 1) {
+	for (i = 0; i < dh->q_count && i < q_size; i += 1) {
 		fprintf(
 			f,
 			"; %s	%"PRIu16"	%"PRIu16"\n",
@@ -590,7 +591,8 @@ static void child_respond (
 		struct dns_query *q,
 		const size_t q_size)
 {
-	const uint16_t qid = dh->id;
+	const struct dns_header org_dh = *dh;
+	const uint16_t qtype = q[0].desc.qtype;
 	char rdata[256];
 	size_t offset = 0, l;
 	bool bfr;
@@ -598,32 +600,38 @@ static void child_respond (
 	uint16_t lptr;
 	uint8_t txtlen;
 
-	memset(dh, 0, sizeof(struct dns_header));
-		dh->id = htons(qid);
-	dh->aa = true;
-	// dh->opcode = 0;
-	dh->qr = true;
-	// dh->rcode = 0;
-
-	dh->q_count = htons(1);
-	dh->ans_count = htons(1);
-
-	if (!bufsink(buf, dh, sizeof(struct dns_header), &offset, bufsize)) {
-		goto TRUNC;
-	}
-
-	// QUESTIONS
-
 	l = dns_labelize(q[0].name, rdata, sizeof(rdata));
 	assert(l > 0);
 	q[0].desc.qclass = htons(q[0].desc.qclass);
 	q[0].desc.qtype = htons(q[0].desc.qtype);
 
+	memset(dh, 0, sizeof(struct dns_header));
+	dh->id = htons(org_dh.id);
+	dh->aa = org_dh.rd ? false : true;
+	dh->qr = true;
+	dh->ra = true;
+	dh->q_count = htons(1);
+
+	switch (qtype) {
+	case 1:
+	case 28:
+	case 16:
+		dh->ans_count = htons(1);
+		break;
+	default:
+		dh->rcode = 3;
+	}
+
 	bfr =
+		bufsink(buf, dh, sizeof(struct dns_header), &offset, bufsize) &&
 		bufsink(buf, rdata, l, &offset, bufsize) &&
 		bufsink(buf, &q[0].desc, sizeof(q[0].desc), &offset, bufsize);
 	if (!bfr) {
 		goto TRUNC;
+	}
+
+	if (dh->rcode != 0) {
+		goto SEND;
 	}
 
 	// ANSWERS
@@ -633,27 +641,56 @@ static void child_respond (
 		goto TRUNC;
 	}
 
-	rnd_cpp(g.rnd, &txtlen, sizeof(txtlen));
-	rnd_cpp(g.rnd, rdata, txtlen);
-	for (size_t i = 0; i < txtlen; i += 1) {
-		rdata[i] = (char)(((uint_fast8_t)rdata[i] % 95) + 32); // 32 ~ 126 (inc)
+	switch (qtype) {
+	case 1:
+		rnd_cpp(g.rnd, rdata, 4);
+		rr.type = htons(1);
+		rr.class = htons(1);
+		rr.ttl = htonl(86400);
+		rr.data_len = htons(4);
+
+		bfr =
+			bufsink(buf, &rr, sizeof(rr), &offset, bufsize) &&
+			bufsink(buf, rdata, 4, &offset, bufsize);
+		break;
+	case 28:
+		rnd_cpp(g.rnd, rdata, 16);
+		rr.type = htons(28);
+		rr.class = htons(1);
+		rr.ttl = htonl(86400);
+		rr.data_len = htons(16);
+
+		bfr =
+			bufsink(buf, &rr, sizeof(rr), &offset, bufsize) &&
+			bufsink(buf, rdata, 16, &offset, bufsize);
+		break;
+	case 16:
+		rnd_cpp(g.rnd, &txtlen, sizeof(txtlen));
+		rnd_cpp(g.rnd, rdata, txtlen);
+		for (size_t i = 0; i < txtlen; i += 1) {
+			rdata[i] = (char)(((uint_fast8_t)rdata[i] % 95) + 32); // 32 ~ 126 (inc)
+		}
+
+		rr.type = htons(16);
+		rr.class = htons(1);
+		rr.ttl = htonl(86400);
+		rr.data_len = htons((uint16_t)txtlen + 1);
+
+		bfr =
+			bufsink(buf, &rr, sizeof(rr), &offset, bufsize) &&
+			bufsink(buf, &txtlen, 1, &offset, bufsize) &&
+			bufsink(buf, rdata, txtlen, &offset, bufsize);
+		break;
+	default:
+		return;
 	}
 
-	rr.type = htons(16);
-	rr.class = htons(1);
-	rr.ttl = htonl(86400);
-	rr.data_len = htons((uint16_t)txtlen + 1);
-
-	bfr =
-		bufsink(buf, &rr, sizeof(rr), &offset, bufsize) &&
-		bufsink(buf, &txtlen, 1, &offset, bufsize) &&
-		bufsink(buf, rdata, txtlen, &offset, bufsize);
 	if (!bfr) {
 		goto TRUNC;
 	}
 
+SEND:
 	sendto(fd, buf, offset, MSG_NOSIGNAL, sa, sl);
-
 	return;
 TRUNC:
 	// TODO
@@ -703,7 +740,7 @@ static bool child_serve_tail (
 	}
 	if (params.vl > 4) {
 		print_child_header(stderr);
-		report_dns_msg(stderr, dh, q);
+		report_dns_msg(stderr, dh, q, q_size);
 	}
 
 	if (dh->q_count > q_size) {
@@ -717,7 +754,7 @@ static bool child_serve_tail (
 		}
 		return false;
 	}
-	if (dh->qr || dh->opcode != 0 || dh->q_count == 0 || q[0].desc.qtype != 16) {
+	if (dh->qr || dh->opcode != 0 || dh->q_count == 0) {
 		if (params.vl > 4) {
 			print_child_header(stderr);
 			fprintf(stderr, "dropping irrelevant query\n");
@@ -879,9 +916,22 @@ static int do_service (void) {
 	pid_t arr[params.nchild];
 	int ec;
 	int caught;
+	struct sigaction sa = { 0, };
+	sigset_t ss_block, ss_wait;
+
+	sa.sa_handler = SIG_IGN;
+	sa.sa_flags = SA_RESETHAND;
+	sigemptyset(&ss_block);
+	sigaddset(&ss_block, SIGTERM);
+	sigaddset(&ss_block, SIGINT);
+	sigemptyset(&ss_wait);
+	sigaddset(&ss_wait, SIGTERM);
+	sigaddset(&ss_wait, SIGINT);
+	sigaddset(&ss_wait, SIGCHLD);
 
 	memset(arr, 0, sizeof(pid_t) * params.nchild);
 
+	sigprocmask(SIG_BLOCK, &ss_block, NULL);
 	for (unsigned long i = 0; i < params.nchild; i += 1) {
 		arr[i] = fork();
 		if (arr[i] < 0) {
@@ -890,6 +940,7 @@ static int do_service (void) {
 			return 1;
 		}
 		else if (arr[i] == 0) {
+			sigprocmask(SIG_UNBLOCK, &ss_block, NULL);
 			g.pid = getpid();
 			alloc_rnd();
 
@@ -903,9 +954,16 @@ static int do_service (void) {
 	g.s_udp.fd = -1;
 	g.s_tcp.fd = -1;
 
-	pause();
+	sigaction(SIGTERM, &sa, NULL);
+	sigaction(SIGINT, &sa, NULL);
+
+	sigwait(&ss_wait, &caught);
+	sigprocmask(SIG_UNBLOCK, &ss_block, NULL);
 
 	reap_procs(arr, params.nchild, SIGHUP);
+	if (caught == SIGCHLD) {
+		return 1;
+	}
 	return 0;
 }
 

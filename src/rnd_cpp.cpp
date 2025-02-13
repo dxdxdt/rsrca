@@ -162,6 +162,10 @@ void rnd_cpp_seed (void *ctx_in, const void *seed) {
 void rnd_cpp_deseed (void *ctx_in) {
 	rnd_cpp_ctx_t *ctx = (rnd_cpp_ctx_t*)ctx_in;
 
+	if (ctx == NULL) {
+		return;
+	}
+
 	delete ctx->engine;
 	ctx->engine = nullptr;
 }
