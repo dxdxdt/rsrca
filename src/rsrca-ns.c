@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <assert.h>
 #include <string.h>
 #include <signal.h>
@@ -17,6 +18,7 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <arpa/inet.h>
+#include <bsd/sys/time.h>
 
 #include "dns-utils.h"
 #include "rnd_cpp.h"
@@ -27,10 +29,23 @@ static_assert(EAGAIN == EWOULDBLOCK);
 
 
 struct tcp_ctx {
+	struct tcp_ctx *prev;
+	struct tcp_ctx *next;
+	const struct pollfd *pfd;
 	struct timespec last_op;
-	size_t expected;
-	size_t len;
-	uint8_t buf[512];
+	struct {
+		size_t len;
+		uint8_t m[65536];
+	} in;
+	struct {
+		size_t len;
+		uint8_t m[65536];
+	} out;
+	union {
+		struct sockaddr_storage ss;
+		struct sockaddr sa;
+	} addr;
+	int fd;
 };
 
 
@@ -47,6 +62,7 @@ struct {
 		bool udp;
 		bool tcp;
 	} flags;
+	struct timespec timeout;
 } params;
 
 struct {
@@ -70,20 +86,24 @@ struct {
 		int fd;
 	} s_tcp;
 	struct {
-		size_t nb_conn;
+		size_t size;
 		struct pollfd *pfd;
-		struct tcp_ctx *pb;
+		struct pollfd *pfd_base;
+		struct tcp_ctx *list;
+		size_t list_len;
 	} cctx;
 	pid_t pid;
 	socklen_t addr_sl;
+	struct timespec tick_start;
 } g;
 
 static void init_params (void) {
 	params.backlog = 4096;
-	params.maxconn = 2048;
+	params.maxconn = 1000;
 	params.port = "53";
 	params.vl = 2;
 	params.nchild = (unsigned long)sysconf(_SC_NPROCESSORS_ONLN);
+	params.timeout.tv_sec = 15;
 }
 
 static void init_g (void) {
@@ -93,26 +113,28 @@ static void init_g (void) {
 }
 
 static bool alloc_cctx (void) {
-	bool ret;
-
-	g.cctx.nb_conn = 0;
 	free(g.cctx.pfd);
-	free(g.cctx.pb);
 
-	g.cctx.pb = calloc(params.maxconn, sizeof(struct tcp_ctx));
-	g.cctx.pfd = calloc(2 + params.maxconn, sizeof(struct pollfd));
+	g.cctx.size = 2 + params.maxconn;
+	g.cctx.pfd = calloc(g.cctx.size, sizeof(struct pollfd));
 
-	ret = g.cctx.pfd != NULL && g.cctx.pb != NULL;
-	if (ret) {
-		for (size_t i = 0; i < 2 + params.maxconn; i += 1) {
-			g.cctx.pfd[i].fd = -1;
-		}
+	if (g.cctx.pfd != NULL) {
+		g.cctx.size = params.maxconn;
+		g.cctx.pfd_base = g.cctx.pfd + 2;
+		// for (size_t i = 0; i < g.cctx.size; i += 1) {
+		// 	g.cctx.pfd[i].fd = -1;
+		// }
 	}
 	else {
+		free(g.cctx.pfd);
+		g.cctx.size = 0;
+		g.cctx.pfd = NULL;
+
 		perror(ARGV0": alloc_cctx()");
+		return false;
 	}
 
-	return ret;
+	return true;
 }
 
 static void seed_rnd (void *ctx, const size_t ss) {
@@ -163,15 +185,19 @@ static void deinit_g (void) {
 }
 
 static void print_help (void) {
-	// TODO
+	fprintf(
+		stdout,
+		"Usage: "ARGV0" [-hvq46ut] [-H ADDR] [-p PORT] [-T PROCS] [-M MAX_CONN]\n"
+		"\t[-X TIMEOUT]\n");
 }
 
 static bool parse_args (const int argc, const char **argv) {
 	int fr;
-	long tmp;
+	long tmpl;
+	size_t tmps;
 
 	while (true) {
-		fr = getopt(argc, (char*const*)argv, "hH:p:vT:46tu");
+		fr = getopt(argc, (char*const*)argv, "hH:p:vqT:46tuM:X:");
 		if (fr < 0) {
 			break;
 		}
@@ -181,24 +207,51 @@ static bool parse_args (const int argc, const char **argv) {
 		case 'H': params.addr = optarg; break;
 		case 'p': params.port = optarg; break;
 		case 'v': params.vl += 1; break;
+		case 'q': params.vl = 0; break;
 		case 'T':
-			tmp = -1;
-			if (sscanf(optarg, "%ld", &tmp) != 1 || tmp < 0) {
+			tmpl = -1;
+			if (sscanf(optarg, "%ld", &tmpl) != 1 || tmpl < 0) {
 				errno = EINVAL;
-				fprintf(stderr, ARGV0": %s: ", optarg);
+				fprintf(stderr, ARGV0": -T %s: ", optarg);
 				perror(NULL);
 
 				return false;
 			}
-			if (tmp != 0) {
-				params.nchild = (unsigned long)tmp;
+			if (tmpl != 0) {
+				params.nchild = (unsigned long)tmpl;
+			}
+			else {
+				params.nchild = (unsigned long)sysconf(_SC_NPROCESSORS_ONLN);
 			}
 			break;
 		case '4': params.af = AF_INET; break;
 		case '6': params.af = AF_INET6; break;
 		case 'u': params.flags.udp = true; break;
 		case 't': params.flags.tcp = true; break;
-		default: return false;
+		case 'M':
+			tmps = 0;
+			if (sscanf(optarg, "%zu", &tmps) != 1 || tmps == 0) {
+				errno = EINVAL;
+				fprintf(stderr, ARGV0": -M %s: ", optarg);
+				perror(NULL);
+
+				return false;
+			}
+			params.maxconn = tmps;
+			break;
+		case 'X':
+			tmpl = 0;
+			if (sscanf(optarg, "%ld", &tmpl) != 1) {
+				errno = EINVAL;
+				fprintf(stderr, ARGV0": -M %s: ", optarg);
+				perror(NULL);
+
+				return false;
+			}
+			params.timeout.tv_sec = tmpl;
+			break;
+		default:
+			return false;
 		}
 	}
 
@@ -373,19 +426,14 @@ static bool setup_socket (void) {
 		}
 	}
 	else {
-		if (false) {
-			ret = setup_socket_udp(target) && setup_socket_tcp(target);
-		}
-		else {
-			ret = setup_socket_udp(target);
-		}
+		ret = setup_socket_udp(target) && setup_socket_tcp(target);
 	}
 
 	freeaddrinfo(res);
 	return ret;
 }
 
-static void report_udp_dgram (
+static void report_dgram (
 	const struct sockaddr *sa,
 	const uint8_t *buf,
 	const size_t len)
@@ -403,6 +451,12 @@ static void report_udp_dgram (
 
 	fprintf(stderr, "\n");
 }
+
+struct child_udp_send_ctx {
+	struct sockaddr *sa;
+	socklen_t sl;
+	int fd;
+};
 
 static bool parse_dns_msg (
 	const uint8_t *buf,
@@ -581,10 +635,11 @@ static bool bufsink (
 	return true;
 }
 
-static void child_respond (
-		const int fd,
-		struct sockaddr *sa,
-		const socklen_t sl,
+typedef bool(*child_send_ft)(void *, const void *, const size_t);
+
+static bool child_respond (
+		child_send_ft sendf,
+		void *sctx,
 		uint8_t *buf,
 		const size_t bufsize,
 		struct dns_header *dh,
@@ -593,6 +648,7 @@ static void child_respond (
 {
 	const struct dns_header org_dh = *dh;
 	const uint16_t qtype = q[0].desc.qtype;
+	const uint16_t qclass = q[0].desc.qclass;
 	char rdata[256];
 	size_t offset = 0, l;
 	bool bfr;
@@ -665,14 +721,23 @@ static void child_respond (
 			bufsink(buf, rdata, 16, &offset, bufsize);
 		break;
 	case 16:
-		rnd_cpp(g.rnd, &txtlen, sizeof(txtlen));
-		rnd_cpp(g.rnd, rdata, txtlen);
-		for (size_t i = 0; i < txtlen; i += 1) {
-			rdata[i] = (char)(((uint_fast8_t)rdata[i] % 95) + 32); // 32 ~ 126 (inc)
-		}
+		if (qclass == 3) {
+			static const char chaos_str[] =
+				"David Timber <dxdt@dev.snart.me>, rsrca project, 2025";
+			static_assert(sizeof(chaos_str) < 256);
 
+			txtlen = sizeof(chaos_str) - 1;
+			memcpy(rdata, chaos_str, sizeof(chaos_str));
+		}
+		else {
+			rnd_cpp(g.rnd, &txtlen, sizeof(txtlen));
+			rnd_cpp(g.rnd, rdata, txtlen);
+			for (size_t i = 0; i < txtlen; i += 1) {
+				rdata[i] = (char)(((uint_fast8_t)rdata[i] % 95) + 32); // 32 ~ 126 (inc)
+			}
+		}
 		rr.type = htons(16);
-		rr.class = htons(1);
+		rr.class = htons(qclass);
 		rr.ttl = htonl(86400);
 		rr.data_len = htons((uint16_t)txtlen + 1);
 
@@ -682,7 +747,7 @@ static void child_respond (
 			bufsink(buf, rdata, txtlen, &offset, bufsize);
 		break;
 	default:
-		return;
+		return false;
 	}
 
 	if (!bfr) {
@@ -690,17 +755,15 @@ static void child_respond (
 	}
 
 SEND:
-	sendto(fd, buf, offset, MSG_NOSIGNAL, sa, sl);
-	return;
+	return sendf(sctx, buf, offset);
 TRUNC:
-	// TODO
-	return;
+	// TODO: no need for now
+	return false;
 }
 
 static void child_respond_fmterr (
-		const int fd,
-		struct sockaddr *sa,
-		const socklen_t sl,
+		child_send_ft sendf,
+		void *sctx,
 		struct dns_header *dh)
 {
 	const uint16_t qid = htons(dh->id);
@@ -711,13 +774,12 @@ static void child_respond_fmterr (
 	dh->qr = true;
 	dh->rcode = 1;
 
-	sendto(fd, dh, sizeof(struct dns_header), MSG_NOSIGNAL, sa, sl);
+	sendf(sctx, dh, sizeof(struct dns_header));
 }
 
 static bool child_serve_tail (
-		const int fd,
-		struct sockaddr *sa,
-		socklen_t sl,
+		child_send_ft sendf,
+		void *sctx,
 		uint8_t *buf,
 		const size_t bufsize,
 		const size_t msglen,
@@ -734,7 +796,7 @@ static bool child_serve_tail (
 		}
 
 		if (errno == EBADMSG) {
-			child_respond_fmterr(fd, sa, sl, dh);
+			child_respond_fmterr(sendf, sctx, dh);
 		}
 		return false;
 	}
@@ -762,7 +824,13 @@ static bool child_serve_tail (
 		return false;
 	}
 
-	child_respond(fd, sa, sl, buf, bufsize, dh, q, q_size);
+	return child_respond(sendf, sctx, buf, bufsize, dh, q, q_size);
+}
+
+static bool child_udp_send (void *ctx_in, const void *buf, const size_t len) {
+	struct child_udp_send_ctx *ctx = ctx_in;
+
+	sendto(ctx->fd, buf, len, MSG_NOSIGNAL, ctx->sa, ctx->sl);
 
 	return true;
 }
@@ -777,6 +845,7 @@ static void child_serve_udp (
 		const size_t q_size)
 {
 	ssize_t fr;
+	struct child_udp_send_ctx sctx;
 
 	assert(bufsize > 0);
 
@@ -785,7 +854,6 @@ static void child_serve_udp (
 		switch (errno) {
 		case EAGAIN:
 		case ECONNREFUSED:
-		case EINTR:
 			return;
 		}
 		print_child_header(stderr);
@@ -794,63 +862,284 @@ static void child_serve_udp (
 	}
 
 	if (params.vl > 3) {
-		report_udp_dgram(sa, buf, (size_t)fr);
+		report_dgram(sa, buf, (size_t)fr);
 	}
 
-	if (fr > 512 && false) {
-		// truncated (larger than 512 bytes)
-		if (params.vl > 3) {
-			print_child_header(stderr);
-			fprintf(stderr, "ignoring large message\n");
-		}
-		return;
-	}
-
-	child_serve_tail(g.s_udp.fd, sa, *sl, buf, bufsize, (size_t)fr, dh, q, q_size);
+	sctx.fd = g.s_udp.fd;
+	sctx.sa = sa;
+	sctx.sl = *sl;
+	(void)child_serve_tail(
+		child_udp_send,
+		&sctx,
+		buf,
+		bufsize, 
+		(size_t)fr, 
+		dh, 
+		q, 
+		q_size);
 }
 
-static int child_accept_tcp (struct sockaddr *sa, socklen_t *sl) {
-	int ret = accept(g.s_tcp.fd, sa, sl);
+static void child_accept_tcp (struct sockaddr *sa, socklen_t *sl) {
+	struct tcp_ctx *tc;
+	const int ret = accept(g.s_tcp.fd, sa, sl);
+
 	if (ret < 0) {
 		switch (errno) {
 		case EAGAIN:
 		case ECONNABORTED:
 		case EINTR:
 		case EPROTO:
-			return -1;
+			return;
 		}
 		print_child_header(stderr);
 		perror("accept()");
 		abort();
 	}
 
+	assert(g.cctx.size > g.cctx.list_len);
+	assert(*sl <= sizeof(struct sockaddr_storage));
+
+	tc = calloc(1, sizeof(struct tcp_ctx));
+	if (tc == NULL) {
+		print_child_header(stderr);
+		perror("child_accept_tcp()");
+
+		close(ret);
+		return;
+	}
+
+	if (g.cctx.list == NULL) {
+		g.cctx.list = tc;
+	}
+	else {
+		tc->next = g.cctx.list;
+		g.cctx.list->prev = tc;
+		g.cctx.list = tc;
+	}
+
+	tc->last_op = g.tick_start;
+	tc->fd = ret;
+	memcpy(&tc->addr, sa, *sl);
+
+	g.cctx.list_len += 1;
+
 	if (params.vl > 3) {
 		print_child_header(stderr);
-		fprintf(stderr, "accepted TCP connection from ");
+		fprintf(stderr, "accepted TCP conn(fd=%d) from ", ret);
 		print_sin(sa, stderr);
 		fprintf(stderr, "\n");
 	}
+}
 
-	if (true) { // FIXME
-		shutdown(ret, SHUT_RDWR);
-		close(ret);
-		return -1;
+static void child_teardown_tcp (struct tcp_ctx *tc) {
+	assert(g.cctx.list_len > 0);
+
+	if (params.vl > 3) {
+		print_child_header(stderr);
+		fprintf(stderr, "tearing down TCP conn(fd=%d) ", tc->fd);
+		print_sin(&tc->addr.sa, stderr);
+		fprintf(stderr, "\n");
+	}
+
+	if (g.cctx.list == tc) {
+		g.cctx.list = g.cctx.list->next;
+	}
+	else {
+		tc->prev->next = tc->next;
+		if (tc->next != NULL) {
+			tc->next->prev = tc->prev;
+		}
+	}
+
+	close(tc->fd);
+	free(tc);
+	g.cctx.list_len -= 1;
+}
+
+static int child_rebuild_pfd (void) {
+	size_t i;
+	struct tcp_ctx *tc, *d = NULL;
+	int ret = -1;
+	struct timespec dur;
+	struct timespec ttl;
+	unsigned long ttl_ms;
+
+	for (i = 0, tc = g.cctx.list; tc != NULL; i += 1) {
+		timespecsub(&g.tick_start, &tc->last_op, &dur);
+
+		if (params.timeout.tv_sec >= 0 && timespeccmp(&dur, &params.timeout, >)) {
+			// remove the timed out connection
+			d = tc;
+			tc = tc->next;
+		}
+		else {
+			timespecsub(&params.timeout, &dur, &ttl);
+			ttl_ms = ttl.tv_sec * 1000 + ttl.tv_nsec / 1000000;
+			if (ttl_ms > INT_MAX) {
+				// overflow. this shouldn't really happen.
+				ttl_ms = INT_MAX;
+			}
+			if (ret < 0 || ttl_ms < (unsigned long)ret) {
+				// find the connection with least ttl value
+				ret = ttl_ms;
+			}
+
+			tc->pfd = g.cctx.pfd_base + i;
+			g.cctx.pfd_base[i].fd = tc->fd;
+			if (tc->out.len > 0) {
+				g.cctx.pfd_base[i].events = POLLOUT;
+			}
+			else {
+				g.cctx.pfd_base[i].events = POLLIN;
+			}
+
+			tc = tc->next;
+		}
+
+		if (d != NULL) {
+			child_teardown_tcp(d);
+			d = NULL;
+		}
+	}
+	for (; i < g.cctx.size; i += 1) {
+		g.cctx.pfd_base[i].fd = -1;
 	}
 
 	return ret;
 }
 
+static bool child_tcp_send (void *ctx_in, const void *buf, const size_t len) {
+	struct tcp_ctx *ctx = ctx_in;
+	const uint16_t msglen = htons((uint16_t)len);
+	ssize_t wfr;
+
+	assert(0 < len);
+	if (len + 2 > sizeof(ctx->out.m)) {
+		errno = E2BIG;
+		return false;
+	}
+
+	memcpy(ctx->out.m, &msglen, 2);
+	memcpy(ctx->out.m + 2, buf, len);
+	ctx->out.len = 2 + len;
+
+	wfr = send(ctx->fd, ctx->out.m, ctx->out.len, MSG_NOSIGNAL);
+	// wfr = write(ctx->fd, buf, len);
+	if (wfr < 0) {
+		return false;
+	}
+
+	ctx->out.len -= wfr;
+	memcpy(ctx->out.m, (const uint8_t*)buf + wfr, ctx->out.len);
+
+	return true;
+}
+
+static bool child_consume_tcp (
+		struct tcp_ctx *tc,
+		uint8_t *buf,
+		const size_t bufsize,
+		struct dns_header *dh,
+		struct dns_query *q,
+		const size_t q_size)
+{
+	uint16_t msglen;
+	bool fr;
+	size_t consumed;
+
+	while (tc->in.len >= 2) {
+		msglen = ntohs(*(uint16_t*)tc->in.m);
+		if (msglen > tc->in.len - 2) {
+			break;
+		}
+
+		memcpy(buf, tc->in.m + 2, msglen);
+
+		consumed = 2 + msglen;
+		memmove(tc->in.m, tc->in.m + consumed, tc->in.len - consumed);
+		tc->in.len -= consumed;
+
+		if (params.vl > 3) {
+			report_dgram(&tc->addr.sa, buf, msglen);
+		}
+
+		fr = child_serve_tail(child_tcp_send, tc, buf, bufsize, msglen, dh, q, q_size);
+		if (!fr) {
+			return false;
+		}
+		tc->last_op = g.tick_start;
+	}
+
+	return true;
+}
+
+static void child_serve_tcp (
+		uint8_t *buf,
+		const size_t bufsize,
+		struct dns_header *dh,
+		struct dns_query *q,
+		const size_t q_size)
+{
+	struct tcp_ctx *tc = g.cctx.list, *d;
+	ssize_t fr;
+	size_t rem;
+
+	assert(sizeof(tc->in.m) > 514);
+
+	while (tc != NULL) {
+		if (tc->pfd != NULL && tc->pfd->revents) {
+			if (tc->out.len > 0) {
+				fr = write(tc->fd, tc->out.m, tc->out.len);
+				assert(fr != 0);
+				if (fr < 0) {
+					// TODO: report error
+					goto DROP;
+				}
+
+				rem = tc->out.len - fr;
+				tc->out.len = rem;
+				memmove(tc->out.m, tc->out.m + fr, rem);
+			}
+			else {
+				rem = sizeof(tc->in.m) - tc->in.len;
+				fr = read(tc->fd, tc->in.m + tc->in.len, rem);
+				if (fr < 0) {
+					// TODO: report error
+					goto DROP;
+				}
+				else if (fr == 0) {
+					shutdown(tc->fd, SHUT_RDWR);
+					goto DROP;
+				}
+				else {
+					tc->in.len += fr;
+					if (!child_consume_tcp(tc, buf, bufsize, dh, q, q_size)) {
+						// TODO: report error
+						goto DROP;
+					}
+				}
+			}
+		}
+
+		tc = tc->next;
+		continue;
+DROP:
+		d = tc;
+		tc = tc->next;
+		child_teardown_tcp(d);
+	}
+}
+
 static int child_main (void) {
 #define Q_SIZE (1)
-	static uint8_t udpbuf[65535];
+	static uint8_t msgbuf[65535];
 	static struct dns_header dh;
 	static struct dns_query q[Q_SIZE];
 
 	int fr;
 	struct pollfd *pfd_udp = g.cctx.pfd + 0;
-	struct pollfd *pfd_tcp_main = g.cctx.pfd + 1;
-	struct pollfd *pfd_tcp_pool = g.cctx.pfd + 2;
-	int poll_timeout = -1;
+	struct pollfd *pfd_tcp = g.cctx.pfd + 1;
+	int poll_timeout;
 
 	union {
 		struct sockaddr_storage _;
@@ -860,87 +1149,90 @@ static int child_main (void) {
 
 	pfd_udp->fd = g.s_udp.fd;
 	pfd_udp->events = POLLIN;
-	pfd_tcp_main->fd = g.s_tcp.fd;
-	pfd_tcp_main->events = POLL_IN;
+	pfd_tcp->events = POLLIN;
 
-	assert(pfd_udp->fd >= 0 || pfd_tcp_main->fd >= 0);
+	assert(pfd_udp->fd >= 0 || pfd_tcp->fd >= 0);
 
 	while (true) {
-		// TODO: calculate poll_timeout to implement TCP timeout
+		clock_gettime(CLOCK_MONOTONIC, &g.tick_start);
 
-		fr = poll(g.cctx.pfd, 2 + (nfds_t)g.cctx.nb_conn, poll_timeout);
+		if (g.cctx.list_len < g.cctx.size) {
+			pfd_tcp->fd = g.s_tcp.fd;
+		}
+		else {
+			pfd_tcp->fd = -1;
+		}
+		poll_timeout = child_rebuild_pfd();
+
+		fr = poll(g.cctx.pfd, (nfds_t)g.cctx.size + 2, poll_timeout);
+		clock_gettime(CLOCK_MONOTONIC, &g.tick_start);
 		if (fr < 0) {
-			if (errno == EINTR) {
-				continue;
-			}
 			print_child_header(stderr);
-			perror("poll()");
+			switch (errno) {
+			case EINTR: continue;
+			case EINVAL:
+				fprintf(stderr, "poll() returned EINVAL! Check RLIMIT_NOFILE(ulimit -n)\n");
+				break;
+			default:
+				perror("poll()");
+			}
+
 			abort();
 		}
 
-		if (pfd_udp->fd >= 0 && pfd_udp->revents) {
+		if (pfd_udp->revents) {
 			sl = sizeof(addr);
-			child_serve_udp(&addr.sa, &sl, udpbuf, sizeof(udpbuf), &dh, q, Q_SIZE);
+			child_serve_udp(&addr.sa, &sl, msgbuf, sizeof(msgbuf), &dh, q, Q_SIZE);
 		}
 
-		if (pfd_tcp_main->fd >= 0 && pfd_tcp_main->revents) {
+		if (pfd_tcp->revents) {
 			sl = sizeof(addr);
-			fr = child_accept_tcp(&addr.sa, &sl);
-			if (fr >= 0) {
-				// TODO
-			}
+			child_accept_tcp(&addr.sa, &sl);
 		}
 
-		// TODO: iterate over tcp connections
+		child_serve_tcp(msgbuf, sizeof(msgbuf), &dh, q, Q_SIZE);
 	}
 }
 
-static void reap_procs (pid_t *arr, const size_t size, const int term_sig) {
+static void reap_procs (
+		pid_t *arr,
+		const size_t size,
+		const int term_sig,
+		const pid_t excl)
+{
 	for (size_t i = 0; i < size; i += 1) {
-		if (arr[i] <= 0) {
+		if (arr[i] > 0 || arr[i] == excl) {
 			continue;
 		}
 		kill(arr[i], term_sig);
-	}
-
-	for (size_t i = 0; i < size; i += 1) {
-		if (arr[i] <= 0) {
-			continue;
-		}
 		waitpid(arr[i], NULL, 0);
-		arr[i] = 0;
 	}
+	memset(arr, 0, sizeof(pid_t) * size);
 }
 
 static int do_service (void) {
 	pid_t arr[params.nchild];
 	int ec;
-	int caught;
+	pid_t dead_child;
 	struct sigaction sa = { 0, };
-	sigset_t ss_block, ss_wait;
 
 	sa.sa_handler = SIG_IGN;
 	sa.sa_flags = SA_RESETHAND;
-	sigemptyset(&ss_block);
-	sigaddset(&ss_block, SIGTERM);
-	sigaddset(&ss_block, SIGINT);
-	sigemptyset(&ss_wait);
-	sigaddset(&ss_wait, SIGTERM);
-	sigaddset(&ss_wait, SIGINT);
-	sigaddset(&ss_wait, SIGCHLD);
 
 	memset(arr, 0, sizeof(pid_t) * params.nchild);
 
-	sigprocmask(SIG_BLOCK, &ss_block, NULL);
 	for (unsigned long i = 0; i < params.nchild; i += 1) {
 		arr[i] = fork();
 		if (arr[i] < 0) {
 			perror(ARGV0": fork()");
-			reap_procs(arr, params.nchild, SIGKILL);
+			reap_procs(arr, params.nchild, SIGKILL, -1);
 			return 1;
 		}
 		else if (arr[i] == 0) {
-			sigprocmask(SIG_UNBLOCK, &ss_block, NULL);
+			memset(&sa, 0, sizeof(sa));
+			sa.sa_handler = SIG_IGN;
+			sigaction(SIGPIPE, &sa, NULL);
+
 			g.pid = getpid();
 			alloc_rnd();
 
@@ -957,11 +1249,10 @@ static int do_service (void) {
 	sigaction(SIGTERM, &sa, NULL);
 	sigaction(SIGINT, &sa, NULL);
 
-	sigwait(&ss_wait, &caught);
-	sigprocmask(SIG_UNBLOCK, &ss_block, NULL);
+	dead_child = wait(NULL);
+	reap_procs(arr, params.nchild, SIGHUP, dead_child);
 
-	reap_procs(arr, params.nchild, SIGHUP);
-	if (caught == SIGCHLD) {
+	if (dead_child > 0) {
 		return 1;
 	}
 	return 0;
