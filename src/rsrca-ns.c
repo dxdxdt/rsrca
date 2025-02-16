@@ -882,6 +882,7 @@ static void child_serve_udp (
 static void child_accept_tcp (struct sockaddr *sa, socklen_t *sl) {
 	struct tcp_ctx *tc;
 	const int ret = accept(g.s_tcp.fd, sa, sl);
+	int fr;
 
 	if (ret < 0) {
 		switch (errno) {
@@ -895,6 +896,10 @@ static void child_accept_tcp (struct sockaddr *sa, socklen_t *sl) {
 		perror("accept()");
 		abort();
 	}
+
+	fr = fcntl(ret, F_SETFL, O_NONBLOCK);
+	assert(fr == 0);
+	(void)fr;
 
 	assert(g.cctx.size > g.cctx.list_len);
 	assert(*sl <= sizeof(struct sockaddr_storage));
@@ -1201,7 +1206,7 @@ static void reap_procs (
 		const pid_t excl)
 {
 	for (size_t i = 0; i < size; i += 1) {
-		if (arr[i] > 0 || arr[i] == excl) {
+		if (arr[i] < 0 || arr[i] == excl) {
 			continue;
 		}
 		kill(arr[i], term_sig);
@@ -1210,13 +1215,15 @@ static void reap_procs (
 	memset(arr, 0, sizeof(pid_t) * size);
 }
 
+static void handle_exitsig (int) {}
+
 static int do_service (void) {
 	pid_t arr[params.nchild];
 	int ec;
 	pid_t dead_child;
 	struct sigaction sa = { 0, };
 
-	sa.sa_handler = SIG_IGN;
+	sa.sa_handler = handle_exitsig;
 	sa.sa_flags = SA_RESETHAND;
 
 	memset(arr, 0, sizeof(pid_t) * params.nchild);
