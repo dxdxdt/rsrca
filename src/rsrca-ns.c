@@ -306,6 +306,24 @@ static void print_sin (const struct sockaddr *sa_in, FILE *f) {
 	(void)fr;
 }
 
+static void setsockopt_v6only (const int fd) {
+#ifdef IPV6_V6ONLY
+	int ov;
+	int fr;
+
+	if (params.af != AF_INET6) {
+		return;
+	}
+
+	ov = 1;
+	fr = setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &ov, sizeof(ov));
+	assert(fr == 0);
+	(void)fr;
+#else
+	#error This platform doesn't do "one socket for v4 and v6" thing
+#endif
+}
+
 static bool setup_socket_udp (const struct addrinfo *target) {
 	int fr;
 
@@ -315,6 +333,7 @@ static bool setup_socket_udp (const struct addrinfo *target) {
 		perror(ARGV0": socket()");
 		return false;
 	}
+	setsockopt_v6only(g.s_udp.fd);
 
 	fr = bind(g.s_udp.fd, target->ai_addr, target->ai_addrlen);
 	if (fr != 0) {
@@ -345,6 +364,7 @@ static bool setup_socket_tcp (const struct addrinfo *target) {
 		perror(ARGV0": socket()");
 		return false;
 	}
+	setsockopt_v6only(g.s_tcp.fd);
 
 	ov = 1;
 	setsockopt(g.s_tcp.fd, SOL_SOCKET, SO_REUSEADDR, &ov, sizeof(ov));
@@ -399,6 +419,8 @@ static bool setup_socket (void) {
 
 	target = res;
 	if (params.af == 0) {
+		// if no AF option is specified, prefer IPv6 to serve v4 and v6 with one
+		// socket
 		for (p = res; p != NULL; p = p->ai_next) {
 			if (p->ai_family == AF_INET6) {
 				target = p;
