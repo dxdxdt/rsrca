@@ -320,7 +320,7 @@ static void setsockopt_v6only (const int fd) {
 	assert(fr == 0);
 	(void)fr;
 #else
-	#error This platform doesn't do "one socket for v4 and v6" thing
+	#error "This platform doesn't do the **one socket for v4 and v6** thing"
 #endif
 }
 
@@ -1169,7 +1169,7 @@ static int child_main (void) {
 	int poll_timeout;
 
 	union {
-		struct sockaddr_storage _;
+		struct sockaddr_storage ss;
 		struct sockaddr sa;
 	} addr;
 	socklen_t sl;
@@ -1208,12 +1208,12 @@ static int child_main (void) {
 		}
 
 		if (pfd_udp->revents) {
-			sl = sizeof(addr);
+			sl = sizeof(addr.ss);
 			child_serve_udp(&addr.sa, &sl, msgbuf, sizeof(msgbuf), &dh, q, Q_SIZE);
 		}
 
 		if (pfd_tcp->revents) {
-			sl = sizeof(addr);
+			sl = sizeof(addr.ss);
 			child_accept_tcp(&addr.sa, &sl);
 		}
 
