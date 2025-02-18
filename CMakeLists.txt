@@ -34,5 +34,9 @@ add_executable(rsrca-ns
 	src/rsrca-ns.c
 	src/dns-utils.c
 	src/rnd_cpp.cpp)
+add_executable(rsrca-echo src/rsrca-echo.c)
+if (CMAKE_SYSTEM MATCHES Windows)
+	target_link_libraries(rsrca-echo ws2_32)
+endif()
 
-install(TARGETS rsrca rsrca-rnd)
+install(TARGETS rsrca rsrca-rnd rsrca-ns rsrca-echo)
