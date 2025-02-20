@@ -104,7 +104,15 @@
 			"args": [ "-vvT1" ],
 			"stopAtEntry": false,
 			"cwd": "${workspaceFolder}/build",
-			"environment": [],
+			"environment": [
+				// { "name": "RSRCA_PMTUDISC", "value": "dont" },
+				// { "name": "RSRCA_PMTUDISC", "value": "want" },
+				// { "name": "RSRCA_PMTUDISC", "value": "do" },
+				// { "name": "RSRCA_PMTUDISC", "value": "probe" },
+				// { "name": "RSRCA_PMTUDISC", "value": "-2147483648" },
+				// { "name": "RSRCA_PMTUDISC", "value": "0" },
+				// { "name": "RSRCA_PMTUDISC", "value": "" },
+			],
 			"externalConsole": false,
 			"MIMode": "gdb",
 			"setupCommands": [

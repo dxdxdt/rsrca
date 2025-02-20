@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <string.h>
 #include <assert.h>
 #include <errno.h>
 #include <getopt.h>
@@ -29,6 +30,8 @@ struct {
 	size_t maxlen;
 	unsigned long nproc;
 	int verbose;
+	int af;
+	int pmtud;
 	struct {
 		bool help;
 		bool nosend;
@@ -41,7 +44,7 @@ struct {
 #else
 	int fd;
 #endif
-	pthread_spinlock_t stdio_l;
+	pthread_mutex_t stdio_l;
 } g;
 
 #ifdef WIN32
@@ -52,9 +55,21 @@ struct {
 #define psockerr(x) perror(x)
 #endif
 
+static bool ismemzero (const void *m, const size_t len) {
+	const uint8_t *p = m;
+
+	for (size_t i = 0; i < len; i += 1) {
+		if (p[i] != 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static void init_params (void) {
 	params.port = "2007";
 	params.verbose = 1;
+	params.pmtud = -1;
 }
 
 static void init_g (void) {
@@ -63,7 +78,7 @@ static void init_g (void) {
 #else
 	g.fd = -1;
 #endif
-	pthread_spin_init(&g.stdio_l, true);
+	pthread_mutex_init(&g.stdio_l, NULL);
 }
 
 static bool parse_args (const int argc, const char **argv) {
@@ -81,6 +96,7 @@ static bool parse_args (const int argc, const char **argv) {
 		case 'T':
 			if (sscanf(optarg, "%lu", &params.nproc) != 1) {
 				fprintf(stderr, ARGV0": -T %s: ", optarg);
+				errno = EINVAL;
 				perror(NULL);
 				return false;
 			}
@@ -89,6 +105,7 @@ static bool parse_args (const int argc, const char **argv) {
 		case 'l':
 			if (sscanf(optarg, "%zu", &params.maxlen) != 1) {
 				fprintf(stderr, ARGV0": -l %s: ", optarg);
+				errno = EINVAL;
 				perror(NULL);
 				return false;
 			}
@@ -109,16 +126,88 @@ static bool parse_args (const int argc, const char **argv) {
 	return true;
 }
 
+static bool parse_env (void) {
+	static const char KEY[] = "RSRCA_PMTUDISC=";
+	const char **p, *env, *val_src;
+	char val[12];
+	size_t i;
+
+	for (p = (const char **)environ; *p != NULL; p += 1) {
+		env = *p;
+		if (strstr(env, KEY) == env) {
+			val_src = env + (sizeof(KEY) - 1);
+		}
+		else {
+			continue;
+		}
+
+		for (i = 0; i < 11 && val_src[i] != 0; i += 1) {
+			if ('a' <= val_src[i] && val_src[i] <= 'z') {
+				val[i] = val_src[i] - ('a' - 'A');
+			}
+			else {
+				val[i] = val_src[i];
+			}
+		}
+		val[i] = 0;
+
+#ifdef IPV6_PMTUDISC_DONT
+		static_assert(IPV6_PMTUDISC_DONT == IP_PMTUDISC_DONT);
+#endif
+#ifdef IPV6_PMTUDISC_DO
+		static_assert(IPV6_PMTUDISC_DO == IP_PMTUDISC_DO);
+#endif
+#ifdef IPV6_PMTUDISC_PROBE
+		static_assert(IPV6_PMTUDISC_PROBE == IP_PMTUDISC_PROBE);
+#endif
+
+		if (*val == 0) {
+			params.pmtud = -1;
+		}
+		else if (strcmp(val, "WANT") == 0) {
+#ifdef IP_PMTUDISC_WANT
+			static_assert(IPV6_PMTUDISC_WANT == IP_PMTUDISC_WANT);
+			params.pmtud = IP_PMTUDISC_WANT;
+#else
+			errno = ENOTSUP;
+			fprintf(stderr, ARGV0": %s: ", env);
+			perror(NULL);
+			return false;
+#endif
+		}
+		else if (strcmp(val, "DONT") == 0) {
+			params.pmtud = IP_PMTUDISC_DONT;
+		}
+		else if (strcmp(val, "DO") == 0) {
+			params.pmtud = IP_PMTUDISC_DO;
+		}
+		else if (strcmp(val, "PROBE") == 0) {
+			params.pmtud = IP_PMTUDISC_PROBE;
+		}
+		else if (sscanf(val, "%d", &params.pmtud) != 1) {
+			fprintf(stderr, ARGV0": %s: ", env);
+			errno = EINVAL;
+			perror(NULL);
+			return false;
+		}
+	}
+
+	return true;
+}
+
 static void print_help (void) {
-	// TODO
+	printf(
+		"Usage: "ARGV0" [-vhN] [-T THREADS] [-l MAXLEN]\n"
+		"ENV: RSRCA_PMTUDISC=WANT|DONT|DO|PROBE\n"
+	);
 }
 
 static void th_lock_stdio (void) {
-	pthread_spin_lock(&g.stdio_l);
+	pthread_mutex_lock(&g.stdio_l);
 }
 
 static void th_unlock_stdio (void) {
-	pthread_spin_unlock(&g.stdio_l);
+	pthread_mutex_unlock(&g.stdio_l);
 }
 
 static void th_print_header (FILE *f) {
@@ -131,20 +220,19 @@ static void th_print_header (FILE *f) {
 #endif
 }
 
-static void print_sin (FILE *f, const struct sockaddr *sa_in) {
+static void print_sin (FILE *f, const struct sockaddr *sa_in, const int v6only) {
 	union {
 		const struct sockaddr *sa;
 		const struct sockaddr_in *sin;
 		const struct sockaddr_in6 *sin6;
 	} addr;
-	char addrstr[INET6_ADDRSTRLEN];
+	char addrstr[INET6_ADDRSTRLEN] = { 0, };
 	const void *addr_loc;
 	uint16_t port;
 	const char *pfmt;
 	const char *fr;
 
 	addr.sa = sa_in;
-	addrstr[0] = 0;
 
 	static_assert(INET6_ADDRSTRLEN > INET_ADDRSTRLEN);
 	assert(addr.sa->sa_family == AF_INET || addr.sa->sa_family == AF_INET6);
@@ -158,17 +246,37 @@ static void print_sin (FILE *f, const struct sockaddr *sa_in) {
 	case AF_INET6:
 		addr_loc = &addr.sin6->sin6_addr;
 		port = ntohs(addr.sin6->sin6_port);
-		pfmt = "[%s]:%"PRIu16;
+		if (addr.sin6->sin6_scope_id == 0) {
+			if (ismemzero(&addr.sin6->sin6_addr, sizeof(addr.sin6->sin6_addr)) &&
+					v6only == 0)
+			{
+				addrstr[0] = '*';
+				pfmt = "%s:%"PRIu16;
+			}
+			else {
+				pfmt = "[%s]:%"PRIu16;
+			}
+		}
+		else {
+			pfmt = "[%s%%%"PRIu32"]:%"PRIu16;
+		}
 		break;
 	default:
 		abort();
 	}
 
-	fr = inet_ntop(addr.sa->sa_family, addr_loc, addrstr, sizeof(addrstr));
-	assert(fr != NULL);
-	(void)fr;
+	if (addrstr[0] == 0) {
+		fr = inet_ntop(addr.sa->sa_family, addr_loc, addrstr, sizeof(addrstr));
+		assert(fr != NULL);
+		(void)fr;
+	}
 
-	fprintf(f, pfmt, addrstr, port);
+	if (addr.sa->sa_family == AF_INET6 && addr.sin6->sin6_scope_id == 0) {
+		fprintf(f, pfmt, addrstr, port);
+	}
+	else {
+		fprintf(f, pfmt, addrstr, addr.sin6->sin6_scope_id, port);
+	}
 }
 
 static void th_reply (
@@ -190,9 +298,30 @@ static void th_reply (
 #ifdef MSG_NOSIGNAL
 	flags |= MSG_NOSIGNAL;
 #endif
+#ifdef MSG_DONTWAIT
+	// caveat: without this flag, if the destination is a neighbour node,
+	// sendto() could block until NDISC is completed. There's no WSA equivalent.
+
+	// TODO: find out whether the Windows kernel exhibits the same behaviour.
+	flags |= MSG_DONTWAIT;
+#endif
 
 	fr = sendto(g.fd, buf, len, flags, sa, sl);
 	if (params.verbose > 1) {
+#ifdef WIN32
+		// FIXME: useless statement unless the socket is in nonblocking mode
+		if (WSAGetLastError() == WSAEWOULDBLOCK) {
+			return;
+		}
+#else
+		switch (errno) {
+		case EAGAIN:
+#if EAGAIN != EWOULDBLOCK
+		case EWOULDBLOCK:
+#endif
+			return;
+		}
+#endif
 		if (fr < 0) {
 			th_lock_stdio();
 			th_print_header(stderr);
@@ -203,7 +332,7 @@ static void th_reply (
 			th_lock_stdio();
 			th_print_header(stdout);
 			printf("sent %zu to ", (size_t)fr);
-			print_sin(stdout, sa);
+			print_sin(stdout, sa, -1);
 			printf("\n");
 			th_unlock_stdio();
 		}
@@ -253,7 +382,7 @@ tail:
 			th_lock_stdio();
 			th_print_header(stdout);
 			printf("received %zu from ", (size_t)rlen);
-			print_sin(stdout, &addr.sa);
+			print_sin(stdout, &addr.sa, -1);
 			printf("\n");
 			th_unlock_stdio();
 		}
@@ -266,12 +395,36 @@ tail:
 	abort();
 }
 
+static void report_sockname (void) {
+	union {
+		struct sockaddr sa;
+		struct sockaddr_in sin;
+		struct sockaddr_in6 sin6;
+	} addr;
+	socklen_t sl = sizeof(addr);
+	int v6only = -1;
+
+	memset(&addr, 0, sizeof(addr));
+	getsockname(g.fd, &addr.sa, &sl);
+
+#ifdef IPV6_V6ONLY
+	if (addr.sa.sa_family == AF_INET6) {
+		socklen_t sl = sizeof(v6only);
+		getsockopt(g.fd, IPPROTO_IPV6, IPV6_V6ONLY, (char *)&v6only, &sl);
+	}
+#endif
+
+	fprintf(stderr, ARGV0": bound on ");
+	print_sin(stderr, &addr.sa, v6only);
+	fprintf(stderr, "\n");
+}
+
 static bool setup_socket (void) {
 	bool ret = false;
 	struct addrinfo hints = { 0, };
 	struct addrinfo *ai = NULL;
 	struct addrinfo *p, *target;
-	int fr;
+	int fr, slevel, sopt;
 
 	hints.ai_flags = AI_PASSIVE;
 	hints.ai_socktype = SOCK_DGRAM;
@@ -283,11 +436,14 @@ static bool setup_socket (void) {
 	}
 
 	target = ai;
-	// prefer IPv6 to serve v4 and v6 with one socket
-	for (p = ai; p != NULL; p = p->ai_next) {
-		if (p->ai_family == AF_INET6) {
-			target = p;
-			break;
+	if (params.af == 0) {
+		// if no AF option is specified, prefer IPv6 to serve v4 and v6 with one
+		// socket
+		for (p = ai; p != NULL; p = p->ai_next) {
+			if (p->ai_family == AF_INET6) {
+				target = p;
+				break;
+			}
 		}
 	}
 
@@ -302,11 +458,53 @@ static bool setup_socket (void) {
 		goto END;
 	}
 
+#ifdef IPV6_V6ONLY
+	if (target->ai_family == AF_INET6 && params.af == 0) {
+		const int ov = 0;
+		setsockopt(g.fd, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&ov, sizeof(ov));
+	}
+#endif
+
+	if (params.pmtud >= 0) {
+		assert(target->ai_family == AF_INET || target->ai_family == AF_INET6);
+		switch (target->ai_family) {
+		case AF_INET:
+			slevel = IPPROTO_IP;
+			sopt = IP_MTU_DISCOVER;
+			fprintf(stderr, ARGV0": setting IP_MTU_DISCOVER to %d\n", params.pmtud);
+			break;
+		case AF_INET6:
+			slevel = IPPROTO_IPV6;
+			sopt = IPV6_MTU_DISCOVER;
+			fprintf(stderr, ARGV0": setting IPV6_MTU_DISCOVER to %d\n", params.pmtud);
+			break;
+		default:
+			abort();
+		}
+		fr = setsockopt(
+			g.fd,
+			slevel,
+			sopt,
+			(const char*)&params.pmtud,
+			sizeof(params.pmtud));
+		if (fr != 0) {
+			fprintf(
+				stderr,
+				ARGV0": setsockopt(..., %d, %d, ...):",
+				sopt,
+				params.pmtud);
+			psockerr(NULL);
+			goto END;
+		}
+	}
+
 	fr = bind(g.fd, target->ai_addr, target->ai_addrlen);
 	if (fr != 0) {
 		psockerr(ARGV0": bind()");
 		goto END;
 	}
+
+	report_sockname();
 
 	ret = true;
 END:
@@ -349,7 +547,7 @@ int main (const int argc, const char **argv) {
 	init_params();
 	init_g();
 
-	if (!parse_args(argc, argv)) {
+	if (!parse_args(argc, argv) || !parse_env()) {
 		return 2;
 	}
 
