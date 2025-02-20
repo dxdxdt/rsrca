@@ -1,0 +1,9 @@
+#!/bin/bash
+# Demonstrates how to do "UDP ping" the server running rsrca-echo using dig.
+set -e
+while true; do
+	sleep 1 &
+	dig  "@$1" -p2007 +timeout=1 +retries=0 +ignore . | grep '^;; Query time' ||
+		true
+	wait
+done
