@@ -27,7 +27,7 @@
 struct {
 	const char *addr;
 	const char *port;
-	size_t maxlen;
+	ssize_t maxlen;
 	unsigned long nproc;
 	int verbose;
 	int af;
@@ -35,6 +35,7 @@ struct {
 	struct {
 		bool help;
 		bool nosend;
+		bool zf; // zerofill
 	} flags;
 } params;
 
@@ -70,6 +71,7 @@ static void init_params (void) {
 	params.port = "2007";
 	params.verbose = 1;
 	params.pmtud = -1;
+	params.maxlen = -1;
 }
 
 static void init_g (void) {
@@ -85,7 +87,7 @@ static bool parse_args (const int argc, const char **argv) {
 	int fr;
 
 	while (true) {
-		fr = getopt(argc, (char*const*)argv, "vhT:Nl:");
+		fr = getopt(argc, (char*const*)argv, "vhT:Nl:z");
 		if (fr < 0) {
 			break;
 		}
@@ -93,6 +95,8 @@ static bool parse_args (const int argc, const char **argv) {
 		switch (fr) {
 		case 'v': params.verbose += 1; break;
 		case 'h': params.flags.help = true; break;
+		case 'N': params.flags.nosend = true; break;
+		case 'z': params.flags.zf = true; break;
 		case 'T':
 			if (sscanf(optarg, "%lu", &params.nproc) != 1) {
 				fprintf(stderr, ARGV0": -T %s: ", optarg);
@@ -101,9 +105,8 @@ static bool parse_args (const int argc, const char **argv) {
 				return false;
 			}
 			break;
-		case 'N': params.flags.nosend = true; break;
 		case 'l':
-			if (sscanf(optarg, "%zu", &params.maxlen) != 1) {
+			if (sscanf(optarg, "%zd", &params.maxlen) != 1) {
 				fprintf(stderr, ARGV0": -l %s: ", optarg);
 				errno = EINVAL;
 				perror(NULL);
@@ -113,6 +116,11 @@ static bool parse_args (const int argc, const char **argv) {
 		default:
 			return false;
 		}
+	}
+
+	if (params.flags.zf && params.maxlen < 0) {
+		fprintf(stderr, ARGV0": -z option requires -l option\n");
+		return false;
 	}
 
 	if (optind + 1 < argc) {
@@ -197,7 +205,7 @@ static bool parse_env (void) {
 
 static void print_help (void) {
 	printf(
-		"Usage: "ARGV0" [-vhN] [-T THREADS] [-l MAXLEN]\n"
+		"Usage: "ARGV0" [-vhNz] [-T THREADS] [-l LEN]\n"
 		"ENV: RSRCA_PMTUDISC=WANT|DONT|DO|PROBE\n"
 	);
 }
@@ -282,7 +290,7 @@ static void print_sin (FILE *f, const struct sockaddr *sa_in, const int v6only) 
 static void th_reply (
 		const struct sockaddr *sa,
 		const socklen_t sl,
-		const void *buf,
+		void *buf,
 		size_t len)
 {
 	ssize_t fr;
@@ -290,8 +298,14 @@ static void th_reply (
 
 	assert(sl >= (socklen_t)sizeof(struct sockaddr_in) && sa != NULL);
 
-	if (params.maxlen > 0 && params.maxlen < len) {
-		len = params.maxlen;
+	if (params.maxlen >= 0) {
+		if ((size_t)params.maxlen < len) {
+			len = params.maxlen;
+		}
+		else if (params.flags.zf) {
+			memset(buf + len, 0, params.maxlen - len);
+			len = params.maxlen;
+		}
 	}
 
 	flags = 0;
