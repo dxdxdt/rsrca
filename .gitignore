@@ -1,4 +1,4 @@
-/build-release
+/build-*
 /build
 /src/nameservers.json
 /src/scan-dns-servers.lock
