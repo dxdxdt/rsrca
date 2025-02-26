@@ -1,10 +1,22 @@
-# PMTU Attack
+# Random Source Attack("rsrca") Project
+This is a work in progress.
 
-Products that may be affected.
+The way various OSes implement PMTUD is fundamentally flawed. They might as well
+have deprecated PMTUD in IPv6 as min MTU ramped up to 1280 and all the hardware
+manufactured today support MTU way larger than 1500. PMTUD shouldn't really have
+made it to IPv6, but here we are.
 
-- Google Public DNS (closed-sourced): maybe - UDP payload size not set to 1280
-- All the standalone web servers running w/ default kernel IP params around the
-  world
+The major issue is that the internet standard(RFC) mandates caching of /128
+addresses. A v6 LAN prefix is /64. The `2^64` address space is too large for
+modern computers. This can easily be abused for DoS attacks.
+
+Caching /128 addresses doesn't make any sense as a /64 prefix is almost always a
+stub network(ie. terminating L2 segment). There could be some extreme edge
+cases, but that's on the netadmin that let such cases happen. Concealed
+bottleneck MTU paths should always be avoided, at all costs.
+
+So, a compromise: if we want to keep PMTUD in IPv6, maybe we should cache /64
+prefix instead of the whole /128?
 
 ## Notes
 CVEs:
@@ -25,8 +37,27 @@ Prelude:
 ![alt text](doc/image.png)
 
 If anything, PTB and Fragmentation Needed should be rate limited by /64 and /24
-prefix, too. The firewall products can rate limit using SYN by /64 prefixes, not
-/128 addresses.
+prefix, too. The firewall products can rate limit on /64 for all the other types
+of packets such as TCP SYN not /128 addresses. Any implementation that caches
+/128 is basically asking for troubles.
+
+## Reports
+The Windows kernel has more serious problems that needed to be addressed. As
+with other Unices, The Windows kernel also suffer from PMTUD cache flooding
+attack. However, unrelated to the PMTUD issue, I found that the way that Windows
+kernel handles UDP/IPv6 from multiple source addresses has some other
+implications.
+
+[doc/mscvd-ipv6-random-source-attack.md](doc/mscvd-ipv6-random-source-attack.md)
+
+Also found that MS DNS has no sane default value for memory limit. The limit can
+be set, but the point is that the default is unlimited and the way it can be set
+is rather cryptic.
+
+A Windows server running MS DNS with default settings will crash when it's
+filled with garbage DNS query results by a malicious actor.
+
+[doc/mscvd-msdns-no-cachemem-limit.md.md](doc/mscvd-msdns-no-cachemem-limit.md.md)
 
 ## Observation on Public DNS Servers
 To see if pmtu cache flooding attack is possible on public DNS servers, I set up
@@ -100,6 +131,10 @@ through the middleboxes, but one possible attack vector is that the pmtu cache
 flooding could occur on the load balancers. There's simply no way of knowing
 from outside world.
 
+// **UPDATE**: some telcos actually run multiple DNS servers behind LB without
+firewall. I found that Windows servers run by a particular ISP evidently accept
+PTB(the UDP DNS message was returned fragmented)
+
 So I went on to see if the Google public dns servers are susceptible to PTMU
 deflection attack. I had to build my own `dig` to disabled the MIN_MTU settings
 in BIND9([patch](doc/bind9_no-mtu-opt.patch)).
@@ -120,15 +155,21 @@ to the attack. The only thing that needs to be fixed is the UDP MSS so that
 truncated messages are delivered to the clients behind 1280 mtu paths.
 
 ## PTB (Replay) Attack
+// **UPDATE**: tl;dr: set up a TXT record longer than 1280 bytes, run `rsrca` in
+[mtu1280-c netns](https://github.com/si-magic/mtu1280d/tree/master/netns) to
+make the server return it in UDP response.
+
 1. Send a UDP packet(DNS for example) or TCP data behind the "one-way" mtu 1280
    path
 1. The victim server responds to it
 1. The router sends it back with PTB
 1. The PTB is validated and accepted by the server
 1. The new PMTU is cached
-  - ICMP aware applications will attempt to redo the request? (DNS trunc)
+  - ICMP aware applications will attempt to redo the request? (DNS trunc) //
+  **UPDATE**: turns out, getting the info in ICMP error to the userspace very
+    Linux specific(`IP_RECVERR`)
 
-(Continued for replaying attack for TCP connections)
+(Continued for replay attack for TCP connections)
 
 1. the server does retransmission
 1. The malicious router sends the mtu adjusted traffic back to the server
@@ -136,6 +177,12 @@ truncated messages are delivered to the clients behind 1280 mtu paths.
 1. Repeat until the server gives up on (RST)
 
 ## Scanning for Vulnerable DNS Servers
+// **UPDATE**: this is all wrong. There are still Linux/BSD implementations that
+advertises UDP msgsize=4096 and don't care about PMTU_DISC sockopt. The only
+thing that fragmented UDP packets tell us is whether the server is BIND9 or the
+like or not. `version.bind CHAOS TXT` and `hostname.bind CHAOS TXT` queries
+should also be used.
+
 ![alt text](doc/image-5.png)
 
 ![alt text](doc/image-6.png)
@@ -275,8 +322,7 @@ The list:
   vulnerable to the attack
 
 Fire up Wireshark or tcpdump, observe the behaviour of the servers. The use of
-IPv6 fragment indicates possible Microsoft DNS. Yes, fucking Windows fragments
-UDP packets! IPv6 UDP packets!
+IPv6 fragment indicates possible Microsoft DNS.
 
 ![alt text](doc/image-3.png)
 ![alt text](doc/image-2.png)
@@ -290,6 +336,9 @@ do
 	sudo ip netns exec mtu1280-c dig "@$ip" +notcp +ignore +timeout=5 +retries=2 +bufsize=$BUFSIZE $QUERY_STR
 done
 ```
+
+TODO: must be tried multiple times(at least 256 times) as service
+providers(especially legacy telcos) usually run multiple resolvers behind LB
 
 The list:
 
@@ -317,7 +366,10 @@ The list:
 2001:1608:10:25::1c04:b12f
 ```
 
-- All of the servers used IPv6 fragments, indicative of Microsoft DNS
+- All of the servers used IPv6 fragments, indicative of ICMP PTB reaching to the
+  server and Microsoft DNS honoring PMTU by fragmenting UDP packets
+- `UDP size: 4096` also a give way. BIND9 and proprietary DNS implementations
+  use a value way less than that of MS DNS(usually 1232 or 512)
 
 ## Attack on a real Windows Machine
 The general set up
@@ -327,9 +379,14 @@ when the DNS service was off. It appears that MS DNS server implementation has
 some optimisation issues so it's not really a fair trial. But when a single
 source address was used, the system was stable even though the CPU usage was at
 100%. Tried turning off the firewall - no difference. Tried both PTB query and
-simple query answer < 512 bytes. No difference. I think it's just the
-performance issue in the kernel. Random source address attack had no effect when
+simple query answer < 512 bytes. No difference. **I think it's just the
+performance issue in the kernel**. Random source address attack had no effect when
 the DNS server was off.
+
+// **UPDATE**: it was. The issue wasn't the PMTU cache(`netsh int ipv6 show
+dest`) being filled with garbage. I suspect it has something to do with the
+kernel keeping track of all UDP traffic flows, **regardless of whether the
+datagrams are ack'd or not**.
 
 Saw a ratio of 1:10 in traffic amplification(Rx: ~150Mbpx, Tx: 1.2Gbps). Note
 that it's only about 20% of the bandwidth available. Took 3 processes of `rsrca`
@@ -338,14 +395,24 @@ machine, 4 to make it unstable and unresponsive. The RDP connection
 dropping/stuttering, the IIS missing some HTTP requests, GUI becoming
 sluggish/unresponsive/frozen.
 
+// **UPDATE**: turns out to be due to kernel bottleneck
+
 ![alt text](doc/image-4.png)
 
-The CPU usage in the image shows an oscillating pattern. My guess is: when the
-context locks up in the cache update, the amount of traffic getting processed
-drops and shoots back up again when cache gc takes less time to finish.
+// **UPDATE**: I suspect that the sawtooth pattern is from the processes not
+getting CPU time when the kernel is bottlenecking
+
+The CPU usage in the image shows an ~~oscillating~~ sawtooth pattern. My guess
+is: when the context locks up in the cache update, the amount of traffic getting
+processed drops and shoots back up again when cache gc takes less time to
+finish.
 
 I'm sure `rsrca` can be implemented in the kernel space for efficiency to reduce
 the resource ratio, but I think the POC is feasible enough.
+
+// **UPDATE**: one core modern CPU can pull a few tens of thousands pps. Good
+enough to take down robust servers. ISP fabric routers can't handle that amount
+of pps, anyways
 
 ## TODO
 - Be sure to block incoming DNS so that the attacker host won't send back ICMP
@@ -354,7 +421,7 @@ the resource ratio, but I think the POC is feasible enough.
   random source and single source. Windows will struggle under attack from
   random sources
 - Measure impact on Nginx/Apache(ALBs and cache servers) and classical LB
-- print ISO time in the logs to plot charts in the paper
+- **print ISO time in the logs to plot charts in the paper**
 
 ### TODO The Double Whammy Lock up
 Ignore TCP RST and ICMP to victim's dst port or mark the packets so that the
@@ -451,6 +518,11 @@ firewalls and the Linux machine to accept PTBs, you can easily poison the cache.
 I won't see if Google public DNS servers' infrastructure accepts crafted PTBs,
 but my money is it must have some impact along the way.
 
+// **UPDATE**: the alternative is having a state table and that's why Windows is
+vulnerable to random source attacks in the first place. We can't win this. PMTUD
+is from old days and should be deprecated. As for TCP, `ICMP_PARANOIA` check is
+still a good idea because TCP is stateful by design
+
 ## IPv6 MTUD is not well designed
 - Perhaps aggregate to /64 prefix rather than individual /128 addresses? The
   whole protocol is built upon the principle that the /64 prefix length is the
@@ -458,6 +530,12 @@ but my money is it must have some impact along the way.
 - /48 is the smallest routable prefix on the internet at the moment. The largest
   block is /16[^1]. `2^16` and `2^48` are in more manageable scale than the
   entire `2^128`
+
+## TODO: mitigation
+[`EnablePMTUDiscovery` registry](https://support.microsoft.com/en-us/topic/recommended-tcp-ip-settings-for-wan-links-with-a-mtu-size-of-less-than-576-2312050e-2a1b-1e89-94a1-b2868afa436f)
+: only disables MSS option in TCP SYN. do not use
+
+Use `IPV6_PMTUDISC_DONT` socket option when developing UDP server.
 
 [^1]: https://www.reddit.com/r/ipv6/comments/17yuqvp/til_capital_one_is_assigned_the_entire_263016/
 [^2]: https://blog.svedr.in/posts/running-path-mtu-discovery-from-windows/
