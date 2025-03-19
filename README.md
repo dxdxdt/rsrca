@@ -18,6 +18,41 @@ bottleneck MTU paths should always be avoided, at all costs.
 So, a compromise: if we want to keep PMTUD in IPv6, maybe we should cache /64
 prefix instead of the whole /128?
 
+## MSCVD
+Some of the issues have been reported to Microsoft Coordinated Vulnerability
+Disclosure(MSCVD).
+
+These issues have been deemed "not vulnerabilities" by Microsoft researchers.
+I'm planning to set up a "patch honeypot", a set of CD/CI automation to detect
+updates that fix the issues I disclosed with Microsoft. In the meantime, you
+know what to do with them. The random source amplification attack is quite
+effective, even to the most robust bare metal server out there.
+
+The competency of the researchers have been [in
+question](https://www.theregister.com/2025/03/17/microsoft_bug_report_troll/)
+over the years. Should you find a vulnerability in Microsoft's products, I
+suggest going to 3rd party bounty programs like
+https://www.zerodayinitiative.com/.
+
+### IPv6 Random Source Attack
+[doc/mscvd-ipv6-random-source-attack.md](doc/mscvd-ipv6-random-source-attack.md)
+
+The Windows kernel has more serious problems that needed to be addressed. As
+with other Unices, The Windows kernel also suffer from PMTUD cache flooding
+attack. However, unrelated to the PMTUD issue, I found that the way that Windows
+kernel handles UDP/IPv6 from multiple source addresses has some other
+implications.
+
+### MS DNS has no cache memory limit
+[doc/mscvd-msdns-no-cachemem-limit.md.md](doc/mscvd-msdns-no-cachemem-limit.md.md)
+
+Also found that MS DNS has no sane default value for memory limit. The limit can
+be set, but the point is that the default is unlimited and the way it can be set
+is rather cryptic.
+
+A Windows server running MS DNS with default settings will crash when it's
+filled with garbage DNS query results by a malicious actor.
+
 ## Notes
 CVEs:
 
@@ -40,24 +75,6 @@ If anything, PTB and Fragmentation Needed should be rate limited by /64 and /24
 prefix, too. The firewall products can rate limit on /64 for all the other types
 of packets such as TCP SYN not /128 addresses. Any implementation that caches
 /128 is basically asking for troubles.
-
-## Reports
-The Windows kernel has more serious problems that needed to be addressed. As
-with other Unices, The Windows kernel also suffer from PMTUD cache flooding
-attack. However, unrelated to the PMTUD issue, I found that the way that Windows
-kernel handles UDP/IPv6 from multiple source addresses has some other
-implications.
-
-[doc/mscvd-ipv6-random-source-attack.md](doc/mscvd-ipv6-random-source-attack.md)
-
-Also found that MS DNS has no sane default value for memory limit. The limit can
-be set, but the point is that the default is unlimited and the way it can be set
-is rather cryptic.
-
-A Windows server running MS DNS with default settings will crash when it's
-filled with garbage DNS query results by a malicious actor.
-
-[doc/mscvd-msdns-no-cachemem-limit.md.md](doc/mscvd-msdns-no-cachemem-limit.md.md)
 
 ## Observation on Public DNS Servers
 To see if pmtu cache flooding attack is possible on public DNS servers, I set up
